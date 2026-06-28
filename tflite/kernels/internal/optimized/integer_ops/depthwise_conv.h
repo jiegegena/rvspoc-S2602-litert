@@ -1416,7 +1416,40 @@ struct QuantizedDepthwiseConvKernel<false, 12, 1> {
     }
   }
 };
-#endif
+#endif  // USE_NEON
+
+#ifdef USE_RVV
+
+// RVV specialization for strided/non-strided, variable input depth, multiplier=1.
+// Uses widening multiply-accumulate: s8 * s8 -> s32.
+template <>
+struct QuantizedDepthwiseConvKernel<true, 0, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const int8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const int8_t* filter_ptr,
+                  int32_t* acc_buffer_ptr) {
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      size_t vl;
+      for (int d = 0; d < input_depth; d += vl) {
+        vl = __riscv_vsetvl_e8m4(input_depth - d);
+        vint8m4_t input_s8 = __riscv_vle8_v_i8m4(input_ptr + d, vl);
+        vint8m4_t filter_s8 = __riscv_vle8_v_i8m4(filter_ptr + d, vl);
+        vint16m8_t input_s16 = __riscv_vsext_vf2_i16m8(input_s8, vl);
+        vint16m8_t filter_s16 = __riscv_vsext_vf2_i16m8(filter_s8, vl);
+        input_s16 = __riscv_vadd_vx_i16m8(input_s16, input_offset, vl);
+        vint32m4_t acc = __riscv_vle32_v_i32m4(acc_buffer_ptr + d, vl);
+        vint16m2_t input_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(input_s16);
+        vint16m2_t filter_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(filter_s16);
+        acc = __riscv_vwmacc_vv_i32m4(acc, input_lo, filter_lo, vl);
+        __riscv_vse32_v_i32m4(acc_buffer_ptr + d, acc, vl);
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += input_depth;
+    }
+  }
+};
+
+#endif  // USE_RVV
 
 // Accumulates the effect of one row of the filter, on a segment of one row
 // of the output, accessing the corresponding one row of the input.
@@ -1599,6 +1632,17 @@ inline void DepthwiseConvInitAccBuffer(int num_output_pixels, int output_depth,
       vst1q_s32(acc_buffer + 16 * i + 12, b3);
     }
   }
+#elif defined(USE_RVV)
+  // RVV: broadcast bias into acc_buffer for any output_depth
+  for (int p = 0; p < num_output_pixels; p++) {
+    size_t vl;
+    for (int d = 0; d < output_depth; d += vl) {
+      vl = __riscv_vsetvl_e32m4(output_depth - d);
+      vint32m4_t bias = __riscv_vle32_v_i32m4(bias_data + d, vl);
+      __riscv_vse32_v_i32m4(acc_buffer + p * output_depth + d, bias, vl);
+    }
+  }
+  i = num_output_pixels;  // Skip scalar fallback
 #endif
   for (; i < num_output_pixels; i++) {
     memcpy(acc_buffer + i * output_depth, bias_data,
@@ -1707,6 +1751,12 @@ inline void DepthwiseConvGeneral(
   TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 2)
   TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 3)
 #endif  // USE_NEON
+
+#ifdef USE_RVV
+  // RVV kernels: variable input depth, most general.
+  // Note: kAllowStrided must be true when kFixedInputDepth==0 (static_assert).
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 1)
+#endif  // USE_RVV
 
   // No matching fast kernel found, use slow fallback.
   if (!row_accum_func) {

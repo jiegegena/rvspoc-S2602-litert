@@ -34,6 +34,7 @@ limitations under the License.
 #include "tflite/core/macros.h"
 #include "tflite/kernels/internal/cppmath.h"
 #include "tflite/kernels/internal/optimized/neon_check.h"
+#include "tflite/kernels/internal/optimized/rvv_check.h"
 #include "tflite/kernels/internal/types.h"
 
 namespace tflite {

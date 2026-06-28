@@ -30,6 +30,10 @@ limitations under the License.
 #include "tflite/kernels/cpu_backend_gemm_x86.h"
 #endif
 
+#if defined(__riscv_vector)
+#include "tflite/kernels/cpu_backend_gemm_rvv.h"
+#endif
+
 namespace tflite {
 
 namespace cpu_backend_gemm {
@@ -60,6 +64,15 @@ template <typename LhsScalar, typename RhsScalar, typename AccumScalar,
           typename DstScalar, QuantizationFlavor quantization_flavor>
 struct GemmImpl : detail::GemmImplX86<LhsScalar, RhsScalar, AccumScalar,
                                       DstScalar, quantization_flavor> {};
+#elif defined(__riscv_vector)
+/* GEMM dispatch implementation for RISC-V Vector Extension.
+ * Uses RVV-optimized GEMM kernels for FP32/INT8/UINT8, bypassing ruy
+ * which has no RISC-V support.
+ */
+template <typename LhsScalar, typename RhsScalar, typename AccumScalar,
+          typename DstScalar, QuantizationFlavor quantization_flavor>
+struct GemmImpl : detail::GemmImplUsingRvv<LhsScalar, RhsScalar, AccumScalar,
+                                            DstScalar, quantization_flavor> {};
 #else
 /* Generic implementation using ruy.
  * Non-ruy implementation will be partial specializations of this template.

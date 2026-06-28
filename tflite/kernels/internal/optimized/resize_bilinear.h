@@ -1312,6 +1312,18 @@ inline void ResizeBilinearKernel(const float* input_ptr, int32_t depth,
     input_ptr++;
   }
 }
+#elif defined(USE_RVV)
+inline void ResizeBilinearKernel(const float* input_ptr, int32_t depth,
+                                 float scale, float* output_ptr) {
+  size_t vl;
+  for (int ic = 0; ic < depth; ic += vl) {
+    vl = __riscv_vsetvl_e32m8(depth - ic);
+    vfloat32m8_t input = __riscv_vle32_v_f32m8(input_ptr + ic, vl);
+    vfloat32m8_t acc = __riscv_vle32_v_f32m8(output_ptr + ic, vl);
+    acc = __riscv_vfmacc_vf_f32m8(acc, scale, input, vl);
+    __riscv_vse32_v_f32m8(output_ptr + ic, acc, vl);
+  }
+}
 #else
 inline void ResizeBilinearKernel(const float* input_ptr, int32 depth,
                                  float scale, float* output_ptr) {
@@ -1462,6 +1474,42 @@ inline void ResizeBilinearKernel2x2(int32_t x0, int32_t x1, int32_t y0,
     // Bottom right corner.
     output_data[output_offset + output_x_offset + output_y_offset] =
         (output + ((x1y0 + x1y1) / 2)) / 2;
+  }
+#elif defined(USE_RVV)
+  TFLITE_DCHECK(x1 >= x0);
+  TFLITE_DCHECK(y1 >= y0);
+
+  {
+    size_t vl;
+    for (int ic = 0; ic < depth; ic += vl) {
+      vl = __riscv_vsetvl_e32m8(depth - ic);
+      const float* input_ptr_x0y0 = &input_data[Offset(input_shape, batch, y0, x0, ic)];
+      vfloat32m8_t x0y0 = __riscv_vle32_v_f32m8(input_ptr_x0y0, vl);
+      vfloat32m8_t x1y0 = __riscv_vle32_v_f32m8(input_ptr_x0y0 + input_x_offset, vl);
+      vfloat32m8_t x0y1 = __riscv_vle32_v_f32m8(input_ptr_x0y0 + input_y_offset, vl);
+      vfloat32m8_t x1y1 = __riscv_vle32_v_f32m8(input_ptr_x0y0 + input_x_offset + input_y_offset, vl);
+
+      // Top left corner.
+      float* output_ptr = &output_data[Offset(output_shape, batch, y, x, ic)];
+      __riscv_vse32_v_f32m8(output_ptr, x0y0, vl);
+
+      // Top right corner: (x0y0 + x1y0) / 2
+      vfloat32m8_t tr = __riscv_vfadd_vv_f32m8(x0y0, x1y0, vl);
+      tr = __riscv_vfmul_vf_f32m8(tr, 0.5f, vl);
+      __riscv_vse32_v_f32m8(output_ptr + output_x_offset, tr, vl);
+
+      // Bottom left corner: (x0y0 + x0y1) / 2
+      vfloat32m8_t bl = __riscv_vfadd_vv_f32m8(x0y0, x0y1, vl);
+      bl = __riscv_vfmul_vf_f32m8(bl, 0.5f, vl);
+      __riscv_vse32_v_f32m8(output_ptr + output_y_offset, bl, vl);
+
+      // Bottom right corner: (bl + (x1y0 + x1y1) / 2) / 2
+      vfloat32m8_t br = __riscv_vfadd_vv_f32m8(x1y0, x1y1, vl);
+      br = __riscv_vfmul_vf_f32m8(br, 0.5f, vl);
+      br = __riscv_vfadd_vv_f32m8(bl, br, vl);
+      br = __riscv_vfmul_vf_f32m8(br, 0.5f, vl);
+      __riscv_vse32_v_f32m8(output_ptr + output_x_offset + output_y_offset, br, vl);
+    }
   }
 #else
   for (int ch = 0; ch < depth; ch++) {

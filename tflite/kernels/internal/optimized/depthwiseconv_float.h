@@ -758,7 +758,59 @@ struct FloatDepthwiseConvKernel<true, 4, 1> {
     }
   }
 };
-#endif
+#endif  // USE_NEON
+
+#ifdef USE_RVV
+
+// RVV specialization for strided/non-strided, variable input depth, multiplier=1.
+// This is the most common case in MobileNet depthwise conv layers.
+// Note: kAllowStrided=true is required when kFixedInputDepth=0 (static_assert),
+// but this kernel works for both stride=1 and stride>1.
+template <>
+struct FloatDepthwiseConvKernel<true, 0, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      size_t vl;
+      for (int d = 0; d < input_depth; d += vl) {
+        vl = __riscv_vsetvl_e32m8(input_depth - d);
+        vfloat32m8_t input = __riscv_vle32_v_f32m8(input_ptr + d, vl);
+        vfloat32m8_t filter = __riscv_vle32_v_f32m8(filter_ptr + d, vl);
+        vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + d, vl);
+        acc = __riscv_vfmacc_vv_f32m8(acc, input, filter, vl);
+        __riscv_vse32_v_f32m8(acc_buffer_ptr + d, acc, vl);
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += input_depth;
+    }
+  }
+};
+
+// RVV specialization for strided/non-strided, variable input depth, multiplier=2.
+template <>
+struct FloatDepthwiseConvKernel<true, 0, 2> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const int output_depth = input_depth * 2;
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int d = 0; d < input_depth; d++) {
+        float in_val = input_ptr[d];
+        size_t vl = __riscv_vsetvl_e32m8(2);
+        vfloat32m8_t filt = __riscv_vle32_v_f32m8(filter_ptr + d * 2, vl);
+        vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + d * 2, vl);
+        vfloat32m8_t in_dup = __riscv_vfmv_v_f_f32m8(in_val, vl);
+        acc = __riscv_vfmacc_vv_f32m8(acc, in_dup, filt, vl);
+        __riscv_vse32_v_f32m8(acc_buffer_ptr + d * 2, acc, vl);
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += output_depth;
+    }
+  }
+};
+
+#endif  // USE_RVV
 
 // Accumulates the effect of one row of the filter, on a segment of one row
 // of the output, accessing the corresponding one row of the input.
@@ -990,6 +1042,14 @@ inline void DepthwiseConvImpl(
 
 #endif  // USE_NEON
 
+#ifdef USE_RVV
+  // RVV kernels: variable input depth, most general.
+  // These use vsetvl to naturally handle any depth.
+  // Note: kAllowStrided must be true when kFixedInputDepth==0 (static_assert).
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 2)
+#endif  // USE_RVV
+
 #undef TFMINI_USE_DEPTHWISECONV_KERNEL
 
   // No matching fast kernel found, use slow fallback.
@@ -1094,6 +1154,18 @@ inline void DepthwiseConvImpl(
 
           vst1q_f32(output_ptr, acc);
           output_ptr += 4;
+        }
+#elif defined(USE_RVV)
+        {
+          size_t vl;
+          for (; i < num_output_values; i += vl) {
+            vl = __riscv_vsetvl_e32m8(num_output_values - i);
+            vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer + i, vl);
+            acc = __riscv_vfmax_vf_f32m8(acc, output_activation_min, vl);
+            acc = __riscv_vfmin_vf_f32m8(acc, output_activation_max, vl);
+            __riscv_vse32_v_f32m8(output_ptr, acc, vl);
+            output_ptr += vl;
+          }
         }
 #endif
         // Handle leftover values, one by one. This is very slow.

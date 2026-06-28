@@ -19,6 +19,10 @@ limitations under the License.
 #include <sys/auxv.h>
 #endif
 
+#if defined __linux__ && defined __riscv
+#include <sys/auxv.h>
+#endif
+
 namespace tflite {
 
 namespace {
@@ -37,11 +41,29 @@ bool DetectDotprodByLinuxAuxvMethod() {
 }
 #endif
 
+// Detect RISC-V V extension using hwcap.
+// HWCAP_ISA_V is bit 24 of AT_HWCAP on Linux RISC-V.
+#if defined __linux__ && defined __riscv
+bool DetectRiscvVByLinuxAuxvMethod() {
+  // HWCAP_ISA_V = (1 << ('V' - 'A')) = (1 << 24)
+  const unsigned long kHwcapIsaV = 1UL << ('V' - 'A');
+  return getauxval(AT_HWCAP) & kHwcapIsaV;
+}
+#endif
+
 }  // namespace
 
 bool DetectArmNeonDotprod() {
 #if defined __linux__ && defined __aarch64__
   return DetectDotprodByLinuxAuxvMethod();
+#else
+  return false;
+#endif
+}
+
+bool DetectRiscvVector() {
+#if defined __linux__ && defined __riscv
+  return DetectRiscvVByLinuxAuxvMethod();
 #else
   return false;
 #endif

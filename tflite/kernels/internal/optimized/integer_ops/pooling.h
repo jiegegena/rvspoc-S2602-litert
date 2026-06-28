@@ -108,6 +108,18 @@ inline void MaxPool(const PoolParams& params, const RuntimeShape& input_shape,
                 acc_reg = vmax_s8(acc_reg, input_reg);
                 vst1_s8(acc + channel, acc_reg);
               }
+#elif defined(USE_RVV)
+              {
+                size_t vl;
+                for (; channel < tranche_depth; channel += vl) {
+                  vl = __riscv_vsetvl_e8m8(tranche_depth - channel);
+                  vint8m8_t acc_reg = __riscv_vle8_v_i8m8(acc + channel, vl);
+                  vint8m8_t input_reg = __riscv_vle8_v_i8m8(input_channel_ptr, vl);
+                  input_channel_ptr += vl;
+                  acc_reg = __riscv_vmax_vv_i8m8(acc_reg, input_reg, vl);
+                  __riscv_vse8_v_i8m8(acc + channel, acc_reg, vl);
+                }
+              }
 #endif
               for (; channel < tranche_depth; ++channel) {
                 acc[channel] = std::max(acc[channel], *input_channel_ptr++);
@@ -130,6 +142,17 @@ inline void MaxPool(const PoolParams& params, const RuntimeShape& input_shape,
             a = vmin_s8(a, vdup_n_s8(params.quantized_activation_max));
             a = vmax_s8(a, vdup_n_s8(params.quantized_activation_min));
             vst1_s8(output_ptr + channel, a);
+          }
+#elif defined(USE_RVV)
+          {
+            size_t vl;
+            for (; channel < tranche_depth; channel += vl) {
+              vl = __riscv_vsetvl_e8m8(tranche_depth - channel);
+              vint8m8_t a = __riscv_vle8_v_i8m8(acc + channel, vl);
+              a = __riscv_vmin_vx_i8m8(a, params.quantized_activation_max, vl);
+              a = __riscv_vmax_vx_i8m8(a, params.quantized_activation_min, vl);
+              __riscv_vse8_v_i8m8(output_ptr + channel, a, vl);
+            }
           }
 #endif
           for (; channel < tranche_depth; ++channel) {
@@ -232,6 +255,23 @@ inline bool AveragePool(const PoolParams& params,
                       vaddw_s16(vld1q_s32(acc + channel + 4 * i), acc_reg[i]));
                 }
               }
+#elif defined(USE_RVV)
+              {
+                size_t vl;
+                for (; channel < tranche_depth; channel += vl) {
+                  vl = __riscv_vsetvl_e8m4(tranche_depth - channel);
+                  vint8m4_t input_reg = __riscv_vle8_v_i8m4(input_channel_ptr, vl);
+                  input_channel_ptr += vl;
+                  // Widen s8 to s16
+                  vint16m8_t input_s16 = __riscv_vsext_vf2_i16m8(input_reg, vl);
+                  // Truncate to m2 for widening add compatibility
+                  vint16m2_t input_s16_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(input_s16);
+                  // Load s32 accumulator and widen-accumulate s16 -> s32
+                  vint32m4_t acc_reg = __riscv_vle32_v_i32m4(acc + channel, vl);
+                  acc_reg = __riscv_vwadd_wv_i32m4(acc_reg, input_s16_lo, vl);
+                  __riscv_vse32_v_i32m4(acc + channel, acc_reg, vl);
+                }
+              }
 #endif
               for (; channel < tranche_depth; ++channel) {
                 acc[channel] += *input_channel_ptr++;
@@ -255,6 +295,30 @@ inline bool AveragePool(const PoolParams& params,
             buf8 = vmin_s8(buf8, vdup_n_s8(params.quantized_activation_max));
             buf8 = vmax_s8(buf8, vdup_n_s8(params.quantized_activation_min));
             vst1_s8(output_ptr + channel, buf8);
+          }
+#elif defined(USE_RVV)
+          {
+            size_t vl;
+            for (; channel < tranche_depth; channel += vl) {
+              vl = __riscv_vsetvl_e32m4(tranche_depth - channel);
+              vint32m4_t vacc = __riscv_vle32_v_i32m4(acc + channel, vl);
+              // Rounded division: (acc + filter_count/2) / filter_count for positive
+              //                    (acc - filter_count/2) / filter_count for negative
+              vint32m4_t half = __riscv_vmv_v_x_i32m4(filter_count / 2, vl);
+              vint32m4_t zero = __riscv_vmv_v_x_i32m4(0, vl);
+              vbool8_t pos = __riscv_vmsgt_vx_i32m4_b8(vacc, 0, vl);
+              vint32m4_t adj = __riscv_vadd_vv_i32m4(vacc, half, vl);
+              vint32m4_t adj_neg = __riscv_vsub_vv_i32m4(vacc, half, vl);
+              vacc = __riscv_vmerge_vvm_i32m4(adj_neg, adj, pos, vl);
+              vacc = __riscv_vdiv_vx_i32m4(vacc, filter_count, vl);
+              // Narrow s32 -> s16 -> s8
+              vint16m2_t vacc16 = __riscv_vncvt_x_x_w_i16m2(vacc, vl);
+              vint8m1_t vacc8 = __riscv_vncvt_x_x_w_i8m1(vacc16, vl);
+              // Clamp
+              vacc8 = __riscv_vmin_vx_i8m1(vacc8, params.quantized_activation_max, vl);
+              vacc8 = __riscv_vmax_vx_i8m1(vacc8, params.quantized_activation_min, vl);
+              __riscv_vse8_v_i8m1(output_ptr + channel, vacc8, vl);
+            }
           }
 #endif
           for (; channel < tranche_depth; ++channel) {

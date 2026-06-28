@@ -20,6 +20,7 @@ limitations under the License.
 // This should be removed, but with a global run of presubmits to catch
 // any such issues. This requires running more than just TFLite presubmits.
 #include "tflite/kernels/internal/optimized/neon_check.h"
+#include "tflite/kernels/internal/optimized/rvv_check.h"
 
 namespace tflite {
 
@@ -27,12 +28,18 @@ namespace tflite {
 // On other architectures, returns false unconditionally.
 bool DetectArmNeonDotprod();
 
+// On RISC-V, returns true if the V extension is present.
+// On other architectures, returns false unconditionally.
+bool DetectRiscvVector();
+
 struct CpuFlags {
   bool neon_dotprod = false;
+  bool riscv_vector = false;
 };
 
 inline void GetCpuFlags(CpuFlags* cpu_flags) {
   cpu_flags->neon_dotprod = DetectArmNeonDotprod();
+  cpu_flags->riscv_vector = DetectRiscvVector();
 }
 
 }  // namespace tflite
