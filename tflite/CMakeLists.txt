@@ -80,6 +80,7 @@ include(CMakeDependentOption)
 option(TFLITE_ENABLE_INSTALL "Enable install rule" OFF)
 option(TFLITE_ENABLE_LABEL_IMAGE "Enable label_image example" OFF)
 option(TFLITE_ENABLE_BENCHMARK_MODEL "Enable the benchmark_model tool" OFF)
+option(TFLITE_ENABLE_ACCURACY_TEST "Enable the accuracy_test tool" OFF)
 option(TFLITE_ENABLE_RUY "Enable experimental RUY integration" OFF)
 option(TFLITE_ENABLE_RESOURCE "Enable experimental support for resources" ON)
 option(TFLITE_ENABLE_NNAPI "Enable NNAPI (Android only)." ON)
@@ -842,16 +843,19 @@ endif()
 set(TFLITE_GENERATED_HEADERS_DIR ${CMAKE_BINARY_DIR}/tensorflow/lite)
 
 # Add the profiling proto directory.
-add_subdirectory(${TFLITE_SOURCE_DIR}/profiling/proto)
+add_subdirectory(${TF_SOURCE_DIR}/lite/profiling/proto ${CMAKE_BINARY_DIR}/profiling/proto)
 
 # Add the benchmark result proto directory.
-add_subdirectory(${TFLITE_SOURCE_DIR}/tools/benchmark/proto)
+add_subdirectory(${TF_SOURCE_DIR}/lite/tools/benchmark/proto ${CMAKE_BINARY_DIR}/tools/benchmark/proto)
 
 # Add the tf example directory.
 add_subdirectory(${TF_SOURCE_DIR}/core/example ${CMAKE_BINARY_DIR}/example_proto_generated)
 
 # The benchmark tool.
 add_subdirectory(${TFLITE_SOURCE_DIR}/tools/benchmark)
+
+# The accuracy test tool.
+add_subdirectory(${TFLITE_SOURCE_DIR}/tools/accuracy)
 
 # The label_image example.
 add_subdirectory(${TFLITE_SOURCE_DIR}/examples/label_image)
