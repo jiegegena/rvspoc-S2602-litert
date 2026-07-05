@@ -32,7 +32,7 @@ target_link_libraries(tflite_accuracy_test
         tensorflow-lite
 )
 
-// Define TFLITE_WITHOUT_XNNPACK when XNNPACK is disabled
+# Define TFLITE_WITHOUT_XNNPACK when XNNPACK is disabled
 if(NOT TFLITE_ENABLE_XNNPACK)
   target_compile_definitions(tflite_accuracy_test PRIVATE TFLITE_WITHOUT_XNNPACK)
 endif()

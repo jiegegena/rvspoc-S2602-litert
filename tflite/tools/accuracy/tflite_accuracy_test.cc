@@ -150,6 +150,30 @@ int GetTop1(const float* output, int num_classes) {
   return max_idx;
 }
 
+int GetTop1(const uint8_t* output, int num_classes) {
+  int max_idx = 0;
+  uint8_t max_val = output[0];
+  for (int i = 1; i < num_classes; ++i) {
+    if (output[i] > max_val) {
+      max_val = output[i];
+      max_idx = i;
+    }
+  }
+  return max_idx;
+}
+
+int GetTop1(const int8_t* output, int num_classes) {
+  int max_idx = 0;
+  int8_t max_val = output[0];
+  for (int i = 1; i < num_classes; ++i) {
+    if (output[i] > max_val) {
+      max_val = output[i];
+      max_idx = i;
+    }
+  }
+  return max_idx;
+}
+
 // ============================================================
 // Load synset_words.txt and build WNID -> index mapping
 // ============================================================
@@ -311,6 +335,20 @@ int RunAccuracyTest(const Flags& flags) {
   TfLiteTensor* input_tensor = interpreter->tensor(input_indices[0]);
   TfLiteTensor* output_tensor = interpreter->tensor(output_indices[0]);
 
+  // Check model type
+  enum class ModelType { kFloat32, kUInt8, kInt8 };
+  ModelType model_type = ModelType::kFloat32;
+  if (input_tensor->type == kTfLiteUInt8) {
+    model_type = ModelType::kUInt8;
+  } else if (input_tensor->type == kTfLiteInt8) {
+    model_type = ModelType::kInt8;
+  }
+
+  const char* type_str = "Float32";
+  if (model_type == ModelType::kUInt8) type_str = "Quantized (uint8)";
+  else if (model_type == ModelType::kInt8) type_str = "Quantized (int8)";
+  std::cout << "Model type: " << type_str << std::endl;
+
   // Get number of output classes
   int num_classes = 1;
   for (int d = 0; d < output_tensor->dims->size; ++d) {
@@ -366,9 +404,26 @@ int RunAccuracyTest(const Flags& flags) {
       continue;
     }
 
-    // Fill input
-    float* input_data = interpreter->typed_input_tensor<float>(0);
-    memcpy(input_data, image.data.data(), image.data.size() * sizeof(float));
+    // Fill input based on model type
+    if (model_type == ModelType::kUInt8) {
+      // Quantized uint8 model: convert [-1, 1] to [0, 255]
+      uint8_t* input_data = interpreter->typed_input_tensor<uint8_t>(0);
+      for (size_t j = 0; j < image.data.size(); ++j) {
+        float val = (image.data[j] + 1.0f) * 127.5f;
+        input_data[j] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, val)));
+      }
+    } else if (model_type == ModelType::kInt8) {
+      // Quantized int8 model: convert [-1, 1] to [-128, 127]
+      int8_t* input_data = interpreter->typed_input_tensor<int8_t>(0);
+      for (size_t j = 0; j < image.data.size(); ++j) {
+        float val = image.data[j] * 127.0f;
+        input_data[j] = static_cast<int8_t>(std::max(-128.0f, std::min(127.0f, val)));
+      }
+    } else {
+      // Float model: copy directly
+      float* input_data = interpreter->typed_input_tensor<float>(0);
+      memcpy(input_data, image.data.data(), image.data.size() * sizeof(float));
+    }
 
     // Inference and timing
     auto start = std::chrono::high_resolution_clock::now();
@@ -382,11 +437,18 @@ int RunAccuracyTest(const Flags& flags) {
         std::chrono::duration<float, std::milli>(end - start).count();
     total_time_ms += infer_ms;
 
-    // Get output
-    float* output_data = interpreter->typed_output_tensor<float>(0);
-
-    // Top-1 prediction
-    int pred = GetTop1(output_data, num_classes) - class_offset;
+    // Get output based on model type
+    int pred;
+    if (model_type == ModelType::kUInt8) {
+      uint8_t* output_data = interpreter->typed_output_tensor<uint8_t>(0);
+      pred = GetTop1(output_data, num_classes) - class_offset;
+    } else if (model_type == ModelType::kInt8) {
+      int8_t* output_data = interpreter->typed_output_tensor<int8_t>(0);
+      pred = GetTop1(output_data, num_classes) - class_offset;
+    } else {
+      float* output_data = interpreter->typed_output_tensor<float>(0);
+      pred = GetTop1(output_data, num_classes) - class_offset;
+    }
     int truth = sample.class_index;
     bool is_correct = (pred == truth);
     if (is_correct) correct++;
