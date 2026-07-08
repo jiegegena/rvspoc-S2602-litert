@@ -34,6 +34,8 @@ namespace optimized_rvv {
 //   bias: optional, length n (int32)
 //
 // Uses widening multiply-accumulate with zero-point handling.
+// All vector operations use m1 grouping to ensure consistent element
+// counts across load, accumulate, and reduce steps.
 inline void RvvGemmUint8Uniform(
     int m, int n, int k, const uint8_t* lhs_data, int lhs_zp,
     const uint8_t* rhs_data, int rhs_zp, int dst_zp,
@@ -46,7 +48,9 @@ inline void RvvGemmUint8Uniform(
     for (int n_idx = 0; n_idx < n; ++n_idx) {
       const uint8_t* lhs_row = lhs_data + static_cast<size_t>(n_idx) * k;
 
-      // Vectorized dot-product over k dimension
+      // Vectorized dot-product over k dimension.
+      // Use m1 grouping for all operations so vl is consistent:
+      //   e8m1 -> e16m2 -> e32m4 widening chain, all with the same vl.
       size_t remaining = static_cast<size_t>(k);
       const size_t vl0 = __riscv_vsetvl_e32m4(remaining);
       vint32m4_t v_acc = __riscv_vmv_v_x_i32m4(0, vl0);
@@ -54,31 +58,30 @@ inline void RvvGemmUint8Uniform(
       const uint8_t* p_lhs = lhs_row;
       const uint8_t* p_rhs = rhs_col;
       while (remaining > 0) {
-        const size_t vl = __riscv_vsetvl_e8m4(remaining);
-        vuint8m4_t v_lhs_u8 = __riscv_vle8_v_u8m4(p_lhs, vl);
-        vuint8m4_t v_rhs_u8 = __riscv_vle8_v_u8m4(p_rhs, vl);
+        const size_t vl = __riscv_vsetvl_e8m1(remaining);
+        vuint8m1_t v_lhs_u8 = __riscv_vle8_v_u8m1(p_lhs, vl);
+        vuint8m1_t v_rhs_u8 = __riscv_vle8_v_u8m1(p_rhs, vl);
 
         // Widen u8 to u16, then reinterpret as s16 for signed arithmetic
-        vuint16m8_t v_lhs_u16 = __riscv_vzext_vf2_u16m8(v_lhs_u8, vl);
-        vuint16m8_t v_rhs_u16 = __riscv_vzext_vf2_u16m8(v_rhs_u8, vl);
-        vint16m8_t v_lhs_s16 = __riscv_vreinterpret_v_u16m8_i16m8(v_lhs_u16);
-        vint16m8_t v_rhs_s16 = __riscv_vreinterpret_v_u16m8_i16m8(v_rhs_u16);
+        vuint16m2_t v_lhs_u16 = __riscv_vzext_vf2_u16m2(v_lhs_u8, vl);
+        vuint16m2_t v_rhs_u16 = __riscv_vzext_vf2_u16m2(v_rhs_u8, vl);
+        vint16m2_t v_lhs_s16 = __riscv_vreinterpret_v_u16m2_i16m2(v_lhs_u16);
+        vint16m2_t v_rhs_s16 = __riscv_vreinterpret_v_u16m2_i16m2(v_rhs_u16);
 
-        // Add zero points
-        v_lhs_s16 = __riscv_vadd_vx_i16m8(v_lhs_s16, lhs_zp, vl);
-        v_rhs_s16 = __riscv_vadd_vx_i16m8(v_rhs_s16, rhs_zp, vl);
+        // Subtract zero points: effective value = val - zp
+        v_lhs_s16 = __riscv_vsub_vx_i16m2(v_lhs_s16, lhs_zp, vl);
+        v_rhs_s16 = __riscv_vsub_vx_i16m2(v_rhs_s16, rhs_zp, vl);
 
-        // Widening MAC: s16 * s16 -> s32
-        vint16m2_t lhs_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(v_lhs_s16);
-        vint16m2_t rhs_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(v_rhs_s16);
-        v_acc = __riscv_vwmacc_vv_i32m4(v_acc, lhs_lo, rhs_lo, vl);
+        // Widening MAC: s16 * s16 -> s32, accumulating into v_acc (m4)
+        // Source m2 (16 elements) -> dest m4 (16 elements), vl matches.
+        v_acc = __riscv_vwmacc_vv_i32m4(v_acc, v_lhs_s16, v_rhs_s16, vl);
 
         p_lhs += vl;
         p_rhs += vl;
         remaining -= vl;
       }
 
-      // Horizontal reduction
+      // Horizontal reduction using vl0 (matches accumulator element count)
       vint32m1_t v_zero = __riscv_vmv_v_x_i32m1(0, __riscv_vsetvl_e32m1(1));
       vint32m1_t v_red =
           __riscv_vredsum_vs_i32m4_i32m1(v_acc, v_zero, vl0);
@@ -88,8 +91,16 @@ inline void RvvGemmUint8Uniform(
         acc += bias_data[n_idx];
       }
 
-      // Uniform quantization
-      acc = (acc * multiplier) >> shift;
+      // Requantization using single-rounding formula (matching ruy's
+      // ApplyMultiplier exactly). Uses 64-bit arithmetic to avoid
+      // int32 overflow.
+      {
+        int total_shift = 31 - shift;
+        int64_t round = static_cast<int64_t>(1) << (total_shift - 1);
+        int64_t result =
+            static_cast<int64_t>(acc) * static_cast<int64_t>(multiplier) + round;
+        acc = static_cast<int32_t>(result >> total_shift);
+      }
 
       // Add destination zero point and clamp
       acc += dst_zp;

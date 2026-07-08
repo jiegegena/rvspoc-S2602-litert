@@ -35,7 +35,9 @@ namespace optimized_rvv {
 //   multiplier_per_channel: per-row quantization multiplier (int32)
 //   shift_per_channel: per-row quantization shift (int)
 //
-// Uses widening multiply-accumulate: s8 * s8 -> s32
+// Uses widening multiply-accumulate: s8 * s8 -> s32.
+// All vector operations use m1 grouping to ensure consistent element
+// counts across load, accumulate, and reduce steps.
 inline void RvvGemmInt8PerChannel(
     int m, int n, int k, const int8_t* lhs_data, const int8_t* rhs_data,
     int rhs_zp, int dst_zp, const int32_t* bias_data,
@@ -48,7 +50,9 @@ inline void RvvGemmInt8PerChannel(
     for (int n_idx = 0; n_idx < n; ++n_idx) {
       const int8_t* lhs_row = lhs_data + static_cast<size_t>(n_idx) * k;
 
-      // Vectorized dot-product over k dimension using widening MAC
+      // Vectorized dot-product over k dimension using widening MAC.
+      // Use m1 grouping for all operations so vl is consistent:
+      //   e8m1 -> e16m2 -> e32m4 widening chain, all with the same vl.
       size_t remaining = static_cast<size_t>(k);
       const size_t vl0 = __riscv_vsetvl_e32m4(remaining);
       vint32m4_t v_acc = __riscv_vmv_v_x_i32m4(0, vl0);
@@ -56,28 +60,26 @@ inline void RvvGemmInt8PerChannel(
       const int8_t* p_lhs = lhs_row;
       const int8_t* p_rhs = rhs_col;
       while (remaining > 0) {
-        const size_t vl = __riscv_vsetvl_e8m4(remaining);
-        vint8m4_t v_lhs = __riscv_vle8_v_i8m4(p_lhs, vl);
-        vint8m4_t v_rhs = __riscv_vle8_v_i8m4(p_rhs, vl);
+        const size_t vl = __riscv_vsetvl_e8m1(remaining);
+        vint8m1_t v_lhs = __riscv_vle8_v_i8m1(p_lhs, vl);
+        vint8m1_t v_rhs = __riscv_vle8_v_i8m1(p_rhs, vl);
 
         // Widen s8 to s16
-        vint16m8_t v_lhs16 = __riscv_vsext_vf2_i16m8(v_lhs, vl);
-        vint16m8_t v_rhs16 = __riscv_vsext_vf2_i16m8(v_rhs, vl);
+        vint16m2_t v_lhs16 = __riscv_vsext_vf2_i16m2(v_lhs, vl);
+        vint16m2_t v_rhs16 = __riscv_vsext_vf2_i16m2(v_rhs, vl);
 
-        // Add rhs zero point to rhs
-        v_rhs16 = __riscv_vadd_vx_i16m8(v_rhs16, rhs_zp, vl);
+        // Subtract rhs zero point from rhs: effective = val - zp
+        v_rhs16 = __riscv_vsub_vx_i16m2(v_rhs16, rhs_zp, vl);
 
-        // Widening multiply-accumulate: s16 * s16 -> s32
-        vint16m2_t lhs_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(v_lhs16);
-        vint16m2_t rhs_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(v_rhs16);
-        v_acc = __riscv_vwmacc_vv_i32m4(v_acc, lhs_lo, rhs_lo, vl);
+        // Widening MAC: s16 * s16 -> s32, accumulating into v_acc (m4)
+        v_acc = __riscv_vwmacc_vv_i32m4(v_acc, v_lhs16, v_rhs16, vl);
 
         p_lhs += vl;
         p_rhs += vl;
         remaining -= vl;
       }
 
-      // Horizontal reduction
+      // Horizontal reduction using vl0 (matches accumulator element count)
       vint32m1_t v_zero = __riscv_vmv_v_x_i32m1(0, __riscv_vsetvl_e32m1(1));
       vint32m1_t v_red =
           __riscv_vredsum_vs_i32m4_i32m1(v_acc, v_zero, vl0);
@@ -88,9 +90,15 @@ inline void RvvGemmInt8PerChannel(
         acc += bias_data[n_idx];
       }
 
-      // Per-channel quantization
-      acc = (acc * multiplier_per_channel[n_idx]) >>
-            shift_per_channel[n_idx];
+      // Per-channel requantization (single-rounding, matching ruy)
+      {
+        int total_shift = 31 - shift_per_channel[n_idx];
+        int64_t round = static_cast<int64_t>(1) << (total_shift - 1);
+        int64_t result = static_cast<int64_t>(acc) *
+                             static_cast<int64_t>(multiplier_per_channel[n_idx]) +
+                         round;
+        acc = static_cast<int32_t>(result >> total_shift);
+      }
 
       // Add destination zero point and clamp
       acc += dst_zp;
@@ -121,27 +129,25 @@ inline void RvvGemmInt8Uniform(
       const int8_t* p_lhs = lhs_row;
       const int8_t* p_rhs = rhs_col;
       while (remaining > 0) {
-        const size_t vl = __riscv_vsetvl_e8m4(remaining);
-        vint8m4_t v_lhs = __riscv_vle8_v_i8m4(p_lhs, vl);
-        vint8m4_t v_rhs = __riscv_vle8_v_i8m4(p_rhs, vl);
+        const size_t vl = __riscv_vsetvl_e8m1(remaining);
+        vint8m1_t v_lhs = __riscv_vle8_v_i8m1(p_lhs, vl);
+        vint8m1_t v_rhs = __riscv_vle8_v_i8m1(p_rhs, vl);
 
-        // Add zero points
-        vint16m8_t v_lhs16 = __riscv_vsext_vf2_i16m8(v_lhs, vl);
-        vint16m8_t v_rhs16 = __riscv_vsext_vf2_i16m8(v_rhs, vl);
-        v_lhs16 = __riscv_vadd_vx_i16m8(v_lhs16, lhs_zp, vl);
-        v_rhs16 = __riscv_vadd_vx_i16m8(v_rhs16, rhs_zp, vl);
+        // Subtract zero points: effective value = val - zp
+        vint16m2_t v_lhs16 = __riscv_vsext_vf2_i16m2(v_lhs, vl);
+        vint16m2_t v_rhs16 = __riscv_vsext_vf2_i16m2(v_rhs, vl);
+        v_lhs16 = __riscv_vsub_vx_i16m2(v_lhs16, lhs_zp, vl);
+        v_rhs16 = __riscv_vsub_vx_i16m2(v_rhs16, rhs_zp, vl);
 
-        // Widening MAC
-        vint16m2_t lhs_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(v_lhs16);
-        vint16m2_t rhs_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(v_rhs16);
-        v_acc = __riscv_vwmacc_vv_i32m4(v_acc, lhs_lo, rhs_lo, vl);
+        // Widening MAC: s16 * s16 -> s32
+        v_acc = __riscv_vwmacc_vv_i32m4(v_acc, v_lhs16, v_rhs16, vl);
 
         p_lhs += vl;
         p_rhs += vl;
         remaining -= vl;
       }
 
-      // Horizontal reduction
+      // Horizontal reduction using vl0 (matches accumulator element count)
       vint32m1_t v_zero = __riscv_vmv_v_x_i32m1(0, __riscv_vsetvl_e32m1(1));
       vint32m1_t v_red =
           __riscv_vredsum_vs_i32m4_i32m1(v_acc, v_zero, vl0);
@@ -151,8 +157,14 @@ inline void RvvGemmInt8Uniform(
         acc += bias_data[n_idx];
       }
 
-      // Uniform quantization
-      acc = (acc * multiplier) >> shift;
+      // Uniform requantization (single-rounding, matching ruy)
+      {
+        int total_shift = 31 - shift;
+        int64_t round = static_cast<int64_t>(1) << (total_shift - 1);
+        int64_t result =
+            static_cast<int64_t>(acc) * static_cast<int64_t>(multiplier) + round;
+        acc = static_cast<int32_t>(result >> total_shift);
+      }
 
       acc += dst_zp;
       acc = std::max(acc, clamp_min);

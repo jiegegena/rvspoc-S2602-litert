@@ -1513,6 +1513,7 @@ struct QuantizedDepthwiseConvKernel<false, 12, 1> {
 
 // RVV specialization for strided/non-strided, variable input depth, multiplier=1.
 // Uses widening multiply-accumulate: u8 * s16 -> s32.
+// Uses m1 grouping for consistent vl across load/widen/MAC/store.
 template <>
 struct QuantizedDepthwiseConvKernel<true, 0, 1> {
   static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
@@ -1522,19 +1523,19 @@ struct QuantizedDepthwiseConvKernel<true, 0, 1> {
     for (int outp = 0; outp < num_output_pixels; outp++) {
       size_t vl;
       for (int d = 0; d < input_depth; d += vl) {
-        vl = __riscv_vsetvl_e8m4(input_depth - d);
-        vuint8m4_t input_u8 = __riscv_vle8_v_u8m4(input_ptr + d, vl);
-        vuint8m4_t filter_u8 = __riscv_vle8_v_u8m4(filter_ptr + d, vl);
-        vuint16m8_t input_u16 = __riscv_vzext_vf2_u16m8(input_u8, vl);
-        vuint16m8_t filter_u16 = __riscv_vzext_vf2_u16m8(filter_u8, vl);
-        vint16m8_t input_s16 = __riscv_vreinterpret_v_u16m8_i16m8(input_u16);
-        vint16m8_t filter_s16 = __riscv_vreinterpret_v_u16m8_i16m8(filter_u16);
-        input_s16 = __riscv_vadd_vx_i16m8(input_s16, input_offset, vl);
-        filter_s16 = __riscv_vadd_vx_i16m8(filter_s16, filter_offset, vl);
+        vl = __riscv_vsetvl_e8m1(input_depth - d);
+        vuint8m1_t input_u8 = __riscv_vle8_v_u8m1(input_ptr + d, vl);
+        vuint8m1_t filter_u8 = __riscv_vle8_v_u8m1(filter_ptr + d, vl);
+        vuint16m2_t input_u16 = __riscv_vzext_vf2_u16m2(input_u8, vl);
+        vuint16m2_t filter_u16 = __riscv_vzext_vf2_u16m2(filter_u8, vl);
+        vint16m2_t input_s16 = __riscv_vreinterpret_v_u16m2_i16m2(input_u16);
+        vint16m2_t filter_s16 = __riscv_vreinterpret_v_u16m2_i16m2(filter_u16);
+        // input_offset / filter_offset are pre-negated zero points,
+        // so vadd is correct: val + (-zp) = val - zp
+        input_s16 = __riscv_vadd_vx_i16m2(input_s16, input_offset, vl);
+        filter_s16 = __riscv_vadd_vx_i16m2(filter_s16, filter_offset, vl);
         vint32m4_t acc = __riscv_vle32_v_i32m4(acc_buffer_ptr + d, vl);
-        vint16m2_t input_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(input_s16);
-        vint16m2_t filter_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(filter_s16);
-        acc = __riscv_vwmacc_vv_i32m4(acc, input_lo, filter_lo, vl);
+        acc = __riscv_vwmacc_vv_i32m4(acc, input_s16, filter_s16, vl);
         __riscv_vse32_v_i32m4(acc_buffer_ptr + d, acc, vl);
       }
       input_ptr += input_ptr_increment;
@@ -2062,33 +2063,6 @@ inline void DepthwiseConvGeneral(
           vst1_lane_u8(output_ptr + 2, res_u8, 2);
           vst1_lane_u8(output_ptr + 3, res_u8, 3);
           output_ptr += 4;
-        }
-#elif defined(USE_RVV)
-        {
-          size_t vl;
-          for (; i < num_output_values; i += vl) {
-            vl = __riscv_vsetvl_e32m4(num_output_values - i);
-            vint32m4_t acc = __riscv_vle32_v_i32m4(acc_buffer + i, vl);
-            if (!shift_left) {
-              // Quantized multiply: vmulh + right shift
-              acc = __riscv_vmulh_vx_i32m4(acc, output_multiplier, vl);
-              acc = __riscv_vsra_vx_i32m4(acc, -output_shift, vl);
-            } else {
-              acc = __riscv_vmul_vx_i32m4(acc, multiplier_power_of_two, vl);
-              acc = __riscv_vmulh_vx_i32m4(acc, output_multiplier, vl);
-            }
-            // Add output offset
-            acc = __riscv_vadd_vx_i32m4(acc, output_offset, vl);
-            // Clamp
-            acc = __riscv_vmax_vx_i32m4(acc, output_activation_min, vl);
-            acc = __riscv_vmin_vx_i32m4(acc, output_activation_max, vl);
-            // Narrow s32 -> s16 -> u8
-            vint16m2_t acc_s16 = __riscv_vncvt_x_x_w_i16m2(acc, vl);
-            vuint8m1_t res_u8 = __riscv_vncvt_x_x_w_u8m1(
-                __riscv_vreinterpret_v_i16m2_u16m2(acc_s16), vl);
-            __riscv_vse8_v_u8m1(output_ptr, res_u8, vl);
-            output_ptr += vl;
-          }
         }
 #endif  // USE_NEON/RVV
 
