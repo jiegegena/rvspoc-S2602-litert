@@ -42,6 +42,8 @@ namespace tflite {
 namespace cpu_backend_gemm {
 namespace detail {
 
+using cpu_backend_gemm::QuantizationFlavor;
+
 // Threadpool tasks for parallel GEMM execution.
 // Each task processes a chunk of the M dimension.
 struct RvvGemmFp32Task : cpu_backend_threadpool::Task {
@@ -52,8 +54,15 @@ struct RvvGemmFp32Task : cpu_backend_threadpool::Task {
   float clamp_min, clamp_max;
   float* dst_chunk;
   void Run() override {
-    optimized_rvv::RvvGemmFp32(m_chunk, n, k, lhs_data, rhs_chunk, bias_data,
-                                clamp_min, clamp_max, dst_chunk);
+    if (k >= 16) {
+      optimized_rvv::RvvGemmFp32Tiled(m_chunk, n, k, lhs_data, rhs_chunk,
+                                       bias_data, clamp_min, clamp_max,
+                                       dst_chunk);
+    } else {
+      optimized_rvv::RvvGemmFp32SmallK(m_chunk, n, k, lhs_data, rhs_chunk,
+                                        bias_data, clamp_min, clamp_max,
+                                        dst_chunk);
+    }
   }
 };
 
@@ -68,10 +77,15 @@ struct RvvGemmInt8PerChannelTask : cpu_backend_threadpool::Task {
   int32_t clamp_min, clamp_max;
   int8_t* dst_chunk;
   void Run() override {
-    optimized_rvv::RvvGemmInt8PerChannel(m_chunk, n, k, lhs_data, rhs_chunk,
-                                          rhs_zp, dst_zp, bias_data, mul_pc,
-                                          shift_pc, clamp_min, clamp_max,
-                                          dst_chunk);
+    if (k >= 16) {
+      optimized_rvv::RvvGemmInt8PerChannelTiled(
+          m_chunk, n, k, lhs_data, rhs_chunk, rhs_zp, dst_zp, bias_data,
+          mul_pc, shift_pc, clamp_min, clamp_max, dst_chunk);
+    } else {
+      optimized_rvv::RvvGemmInt8PerChannel(
+          m_chunk, n, k, lhs_data, rhs_chunk, rhs_zp, dst_zp, bias_data,
+          mul_pc, shift_pc, clamp_min, clamp_max, dst_chunk);
+    }
   }
 };
 
@@ -87,9 +101,15 @@ struct RvvGemmUint8Task : cpu_backend_threadpool::Task {
   int32_t clamp_min, clamp_max;
   uint8_t* dst_chunk;
   void Run() override {
-    optimized_rvv::RvvGemmUint8Uniform(
-        m_chunk, n, k, lhs_data, lhs_zp, rhs_chunk, rhs_zp, dst_zp, bias_data,
-        multiplier, shift, clamp_min, clamp_max, dst_chunk);
+    if (k >= 16) {
+      optimized_rvv::RvvGemmUint8UniformTiled(
+          m_chunk, n, k, lhs_data, lhs_zp, rhs_chunk, rhs_zp, dst_zp,
+          bias_data, multiplier, shift, clamp_min, clamp_max, dst_chunk);
+    } else {
+      optimized_rvv::RvvGemmUint8Uniform(
+          m_chunk, n, k, lhs_data, lhs_zp, rhs_chunk, rhs_zp, dst_zp,
+          bias_data, multiplier, shift, clamp_min, clamp_max, dst_chunk);
+    }
   }
 };
 
@@ -137,9 +157,15 @@ struct GemmImplUsingRvv<float, float, float, float,
     const int n_threads = std::min(max_threads, m);
 
     if (n_threads <= 1) {
-      optimized_rvv::RvvGemmFp32(m, n, k, lhs_data, rhs_data, params.bias,
-                                  params.clamp_min, params.clamp_max,
-                                  dst_data);
+      if (k >= 16) {
+        optimized_rvv::RvvGemmFp32Tiled(m, n, k, lhs_data, rhs_data,
+                                         params.bias, params.clamp_min,
+                                         params.clamp_max, dst_data);
+      } else {
+        optimized_rvv::RvvGemmFp32SmallK(m, n, k, lhs_data, rhs_data,
+                                          params.bias, params.clamp_min,
+                                          params.clamp_max, dst_data);
+      }
       return;
     }
 
@@ -204,10 +230,17 @@ struct GemmImplUsingRvv<int8_t, int8_t, int32_t, int8_t,
     const int32_t cmax = static_cast<int32_t>(params.clamp_max);
 
     if (n_threads <= 1) {
-      optimized_rvv::RvvGemmInt8PerChannel(
-          m, n, k, lhs_data, rhs_data, rhs_zp, dst_zp, params.bias,
-          params.multiplier_fixedpoint_perchannel,
-          params.multiplier_exponent_perchannel, cmin, cmax, dst_data);
+      if (k >= 16) {
+        optimized_rvv::RvvGemmInt8PerChannelTiled(
+            m, n, k, lhs_data, rhs_data, rhs_zp, dst_zp, params.bias,
+            params.multiplier_fixedpoint_perchannel,
+            params.multiplier_exponent_perchannel, cmin, cmax, dst_data);
+      } else {
+        optimized_rvv::RvvGemmInt8PerChannel(
+            m, n, k, lhs_data, rhs_data, rhs_zp, dst_zp, params.bias,
+            params.multiplier_fixedpoint_perchannel,
+            params.multiplier_exponent_perchannel, cmin, cmax, dst_data);
+      }
       return;
     }
 
@@ -273,10 +306,17 @@ struct GemmImplUsingRvv<uint8_t, uint8_t, int32_t, uint8_t,
     const int32_t cmax = static_cast<int32_t>(params.clamp_max);
 
     if (n_threads <= 1) {
-      optimized_rvv::RvvGemmUint8Uniform(
-          m, n, k, lhs_data, lhs_zp, rhs_data, rhs_zp, dst_zp, params.bias,
-          params.multiplier_fixedpoint, params.multiplier_exponent, cmin, cmax,
-          dst_data);
+      if (k >= 16) {
+        optimized_rvv::RvvGemmUint8UniformTiled(
+            m, n, k, lhs_data, lhs_zp, rhs_data, rhs_zp, dst_zp, params.bias,
+            params.multiplier_fixedpoint, params.multiplier_exponent, cmin,
+            cmax, dst_data);
+      } else {
+        optimized_rvv::RvvGemmUint8Uniform(
+            m, n, k, lhs_data, lhs_zp, rhs_data, rhs_zp, dst_zp, params.bias,
+            params.multiplier_fixedpoint, params.multiplier_exponent, cmin,
+            cmax, dst_data);
+      }
       return;
     }
 
