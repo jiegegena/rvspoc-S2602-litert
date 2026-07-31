@@ -1646,44 +1646,88 @@ inline void AddElementwise(int size, const ArithmeticParams& params,
     vst1_u8(output_data + i, clamped);
   }
 #elif defined(USE_RVV)
-  size_t vl;
-  for (; i < size; i += vl) {
-    vl = __riscv_vsetvl_e8m2(size - i);
-    vuint8m2_t v1_u8 = __riscv_vle8_v_u8m2(input1_data + i, vl);
-    vuint8m2_t v2_u8 = __riscv_vle8_v_u8m2(input2_data + i, vl);
-    // Widen to u16, then to s32
-    vuint16m4_t v1_u16 = __riscv_vzext_vf2_u16m4(v1_u8, vl);
-    vuint16m4_t v2_u16 = __riscv_vzext_vf2_u16m4(v2_u8, vl);
-    vint16m4_t v1_s16 = __riscv_vreinterpret_v_u16m4_i16m4(v1_u16);
-    vint16m4_t v2_s16 = __riscv_vreinterpret_v_u16m4_i16m4(v2_u16);
-    vint16m4_t v1_off = __riscv_vadd_vx_i16m4(v1_s16, params.input1_offset, vl);
-    vint16m4_t v2_off = __riscv_vadd_vx_i16m4(v2_s16, params.input2_offset, vl);
-    vint32m8_t x1 = __riscv_vsext_vf2_i32m8(v1_off, vl);
-    vint32m8_t x2 = __riscv_vsext_vf2_i32m8(v2_off, vl);
-    // Left shift
-    x1 = __riscv_vsll_vx_i32m8(x1, params.left_shift, vl);
-    x2 = __riscv_vsll_vx_i32m8(x2, params.left_shift, vl);
-    // Quantized multiply
-    x1 = __riscv_vmulh_vx_i32m8(x1, params.input1_multiplier, vl);
-    x2 = __riscv_vmulh_vx_i32m8(x2, params.input2_multiplier, vl);
-    // Right shift (arithmetic)
-    x1 = __riscv_vsra_vx_i32m8(x1, -params.input1_shift, vl);
-    x2 = __riscv_vsra_vx_i32m8(x2, -params.input2_shift, vl);
-    // Sum
-    vint32m8_t s = __riscv_vadd_vv_i32m8(x1, x2, vl);
-    // Output quantized multiply
-    s = __riscv_vmulh_vx_i32m8(s, params.output_multiplier, vl);
-    s = __riscv_vsra_vx_i32m8(s, -params.output_shift, vl);
-    // Add output offset
-    s = __riscv_vadd_vx_i32m8(s, params.output_offset, vl);
-    // Clamp
-    s = __riscv_vmax_vx_i32m8(s, params.quantized_activation_min, vl);
-    s = __riscv_vmin_vx_i32m8(s, params.quantized_activation_max, vl);
-    // Narrow s32 -> s16 -> u8
-    vint16m4_t s16 = __riscv_vncvt_x_x_w_i16m4(s, vl);
-    vint8m2_t s8 = __riscv_vncvt_x_x_w_i8m2(s16, vl);
-    vuint8m2_t out = __riscv_vreinterpret_v_i8m2_u8m2(s8);
-    __riscv_vse8_v_u8m2(output_data + i, out, vl);
+  // RVV optimized path: exact equivalent of the NEON implementation above.
+  // Uses e8m1/e16m2/e32m4 LMUL chain for load/widen/MAC.
+  // qrdmulh uses vwmul (i32->i64) to match NEON's vqrdmulhq_n_s32:
+  //   saturate_s32((a * b * 2 + 2^31) >> 32)
+  // Input shift uses vsll/vsra to match NEON's vshlq_s32 (no rounding).
+  // Output shift uses RoundingDivideByPOT matching NEON path.
+  {
+    size_t vl;
+    for (; i < size; i += vl) {
+      vl = __riscv_vsetvl_e8m1(size - i);
+      // Load uint8, widen to i16, add offset
+      vint16m2_t v1 = __riscv_vreinterpret_v_u16m2_i16m2(
+          __riscv_vzext_vf2_u16m2(__riscv_vle8_v_u8m1(input1_data + i, vl), vl));
+      vint16m2_t v2 = __riscv_vreinterpret_v_u16m2_i16m2(
+          __riscv_vzext_vf2_u16m2(__riscv_vle8_v_u8m1(input2_data + i, vl), vl));
+      v1 = __riscv_vadd_vx_i16m2(v1, static_cast<int16_t>(params.input1_offset), vl);
+      v2 = __riscv_vadd_vx_i16m2(v2, static_cast<int16_t>(params.input2_offset), vl);
+      // Widen i16 -> i32
+      vint32m4_t x1 = __riscv_vsext_vf2_i32m4(v1, vl);
+      vint32m4_t x2 = __riscv_vsext_vf2_i32m4(v2, vl);
+      // Left shift (matches NEON vshlq_s32 with positive shift)
+      x1 = __riscv_vsll_vx_i32m4(x1, params.left_shift, vl);
+      x2 = __riscv_vsll_vx_i32m4(x2, params.left_shift, vl);
+      // qrdmulh: matches NEON vqrdmulhq_n_s32 exactly.
+      // NEON formula: result = (a * b * 2 + 2^31) >> 32
+      // Note: this is different from gemmlowp's SaturatingRoundingDoublingHighMul
+      // which uses (a * b * 2 + nudge) >> 31 with conditional nudge.
+      {
+        vint64m8_t p = __riscv_vwmul_vx_i64m8(x1, params.input1_multiplier, vl);
+        p = __riscv_vsll_vx_i64m8(p, 1, vl);
+        p = __riscv_vadd_vx_i64m8(p, static_cast<int64_t>(1) << 31, vl);
+        x1 = __riscv_vnsra_wx_i32m4(p, 32, vl);
+      }
+      {
+        vint64m8_t p = __riscv_vwmul_vx_i64m8(x2, params.input2_multiplier, vl);
+        p = __riscv_vsll_vx_i64m8(p, 1, vl);
+        p = __riscv_vadd_vx_i64m8(p, static_cast<int64_t>(1) << 31, vl);
+        x2 = __riscv_vnsra_wx_i32m4(p, 32, vl);
+      }
+      // Input shift: matches NEON vshlq_s32 which handles +/- shift.
+      // Negative shift = arithmetic right shift (no rounding).
+      // Positive shift = left shift.
+      if (params.input1_shift < 0) {
+        x1 = __riscv_vsra_vx_i32m4(x1, -params.input1_shift, vl);
+      } else if (params.input1_shift > 0) {
+        x1 = __riscv_vsll_vx_i32m4(x1, params.input1_shift, vl);
+      }
+      if (params.input2_shift < 0) {
+        x2 = __riscv_vsra_vx_i32m4(x2, -params.input2_shift, vl);
+      } else if (params.input2_shift > 0) {
+        x2 = __riscv_vsll_vx_i32m4(x2, params.input2_shift, vl);
+      }
+      // Sum
+      vint32m4_t s = __riscv_vadd_vv_i32m4(x1, x2, vl);
+      // Output qrdmulh (matches NEON vqrdmulhq_n_s32)
+      {
+        vint64m8_t p = __riscv_vwmul_vx_i64m8(s, params.output_multiplier, vl);
+        p = __riscv_vsll_vx_i64m8(p, 1, vl);
+        p = __riscv_vadd_vx_i64m8(p, static_cast<int64_t>(1) << 31, vl);
+        s = __riscv_vnsra_wx_i32m4(p, 32, vl);
+      }
+      // Output RoundingDivideByPOT (matches NEON path exactly)
+      {
+        const int pot = -params.output_shift;
+        if (pot > 0) {
+          vint32m4_t rnd = __riscv_vsra_vx_i32m4(s, pot - 1, vl);
+          rnd = __riscv_vand_vx_i32m4(rnd, 1, vl);
+          s = __riscv_vsra_vx_i32m4(s, pot, vl);
+          s = __riscv_vadd_vv_i32m4(s, rnd, vl);
+        }
+      }
+      // Narrow i32 -> i16, add output_offset, clamp, store as u8.
+      // Matches NEON: vmovn + vadd + vqmovun.
+      vint16m2_t s16 = __riscv_vncvt_x_x_w_i16m2(s, vl);
+      s16 = __riscv_vadd_vx_i16m2(s16, static_cast<int16_t>(params.output_offset), vl);
+      s16 = __riscv_vmax_vx_i16m2(s16, static_cast<int16_t>(params.quantized_activation_min), vl);
+      s16 = __riscv_vmin_vx_i16m2(s16, static_cast<int16_t>(params.quantized_activation_max), vl);
+      // Saturating narrow i16 -> u8 (matches NEON vqmovun_s16)
+      vuint16m2_t su16 = __riscv_vreinterpret_v_i16m2_u16m2(s16);
+      vuint8m1_t out = __riscv_vncvt_x_x_w_u8m1(su16, vl);
+      __riscv_vse8_v_u8m1(output_data + i, out, vl);
+    }
   }
 #endif  // NEON/RVV
 
@@ -5960,7 +6004,7 @@ inline void Requantize<int8_t, uint8_t>(const int8_t* input_data, int32_t size,
     vst1q_u8(output_data + i, narrowed_result);
   }
 
-#elif defined(USE_RVV)
+  #elif defined(USE_RVV)
   size_t vl;
   for (; i < size; i += vl) {
     vl = __riscv_vsetvl_e8m4(size - i);
