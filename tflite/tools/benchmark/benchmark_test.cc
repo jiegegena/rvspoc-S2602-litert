@@ -690,6 +690,8 @@ TEST(BenchmarkTest, BenchmarkResultFileIsWritten) {
             listener.results().warmup_time_us().count());
   EXPECT_FLOAT_EQ(result.misc_metrics().model_throughput_in_mb_per_sec(),
                   listener.results().throughput_MB_per_second());
+  EXPECT_FLOAT_EQ(result.misc_metrics().throughput_fps(),
+                  listener.results().throughput_fps());
 }
 
 }  // namespace

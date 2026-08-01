@@ -74,6 +74,7 @@ BenchmarkParams BenchmarkModel::DefaultParams() {
   params.AddParam("memory_footprint_check_interval_ms",
                   BenchmarkParam::Create<int32_t>(kMemoryCheckIntervalMs));
   params.AddParam("gpu_invoke_loop_times", BenchmarkParam::Create<int32_t>(1));
+  params.AddParam("batch_size", BenchmarkParam::Create<int32_t>(1));
   return params;
 }
 
@@ -90,6 +91,8 @@ void BenchmarkLoggingListener::OnBenchmarkEnd(const BenchmarkResults& results) {
                    << "First inference: " << warmup_us.first() << ", "
                    << "Warmup (avg): " << warmup_us.avg() << ", "
                    << "Inference (avg): " << inference_us.avg();
+  TFLITE_LOG(INFO) << "Inference throughput (FPS): " << results.throughput_fps()
+                   << " (batch_size=" << results.batch_size() << ")";
 
   if (!init_mem_usage.IsSupported()) return;
   TFLITE_LOG(INFO)
@@ -179,7 +182,11 @@ std::vector<Flag> BenchmarkModel::GetFlags() {
           "gpu_invoke_loop_times", &params_,
           "Number of GPU delegate invoke loop iterations. If > 0 then reported "
           "latency is divided by this number. Used only when "
-          "TFLITE_GPU_ENABLE_INVOKE_LOOP is defined.")};
+          "TFLITE_GPU_ENABLE_INVOKE_LOOP is defined."),
+      CreateFlag<int32_t>(
+          "batch_size", &params_,
+          "Batch size for throughput (FPS) calculation. "
+          "Throughput = batch_size * 1000 / avg_latency_ms.")};
 }
 
 void BenchmarkModel::LogParams() {
@@ -212,6 +219,7 @@ void BenchmarkModel::LogParams() {
                       "will be divided by it.",
                       verbose);
 #endif
+  LOG_BENCHMARK_PARAM(int32_t, "batch_size", "Batch size", verbose);
 }
 
 TfLiteStatus BenchmarkModel::PrepareInputData() { return kTfLiteOk; }
@@ -356,9 +364,10 @@ TfLiteStatus BenchmarkModel::Run() {
     peak_mem_mb = peak_memory_reporter->GetPeakMemUsageInMB();
   }
 
+  int32_t batch_size = params_.Get<int32_t>("batch_size");
   listeners_.OnBenchmarkEnd({model_size_mb, startup_latency_us, input_bytes,
                              warmup_time_us, inference_time_us, init_mem_usage,
-                             overall_mem_usage, peak_mem_mb});
+                             overall_mem_usage, peak_mem_mb, batch_size});
   return status;
 }
 

@@ -319,6 +319,8 @@ class ProtoBenchmarkReporter : public BenchmarkListener {
       result.mutable_misc_metrics()->set_num_warmup_runs(warmup_us.count());
       result.mutable_misc_metrics()->set_model_throughput_in_mb_per_sec(
           results.throughput_MB_per_second());
+      result.mutable_misc_metrics()->set_throughput_fps(
+          results.throughput_fps());
 
       std::ofstream out_file(result_file_path_,
                              std::ios::binary | std::ios::out);

@@ -53,7 +53,7 @@ message MemoryMetrics {
   optional float peak_mem_mb = 3;
 }
 
-// Next ID: 5
+// Next ID: 6
 message MiscMetrics {
   optional float model_size_mb = 1;
   optional int32 num_runs = 2;
@@ -61,6 +61,9 @@ message MiscMetrics {
   // Model throughput in megabytes per second. This is the average throughput
   // of the model over all the inferences.
   optional float model_throughput_in_mb_per_sec = 4;
+  // Inference throughput in frames per second (FPS).
+  // throughput_fps = batch_size * 1000 / avg_latency_ms
+  optional float throughput_fps = 5;
 }
 
 // Next ID: 5

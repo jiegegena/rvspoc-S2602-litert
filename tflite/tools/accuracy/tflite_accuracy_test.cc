@@ -348,6 +348,14 @@ int RunAccuracyTest(const Flags& flags) {
   if (model_type == ModelType::kUInt8) type_str = "Quantized (uint8)";
   else if (model_type == ModelType::kInt8) type_str = "Quantized (int8)";
   std::cout << "Model type: " << type_str << std::endl;
+  if (model_type != ModelType::kFloat32) {
+    std::cout << "Input  quantization: scale=" << input_tensor->params.scale
+              << " zero_point=" << (int)input_tensor->params.zero_point
+              << std::endl;
+    std::cout << "Output quantization: scale=" << output_tensor->params.scale
+              << " zero_point=" << (int)output_tensor->params.zero_point
+              << std::endl;
+  }
 
   // Get number of output classes
   int num_classes = 1;

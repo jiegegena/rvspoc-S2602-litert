@@ -50,7 +50,7 @@ class BenchmarkResults {
                    tensorflow::StatWithPercentiles<int64_t> inference_time_us,
                    const profiling::memory::MemoryUsage& init_mem_usage,
                    const profiling::memory::MemoryUsage& overall_mem_usage,
-                   float peak_mem_mb)
+                   float peak_mem_mb, int32_t batch_size = 1)
       : model_size_mb_(model_size_mb),
         startup_latency_us_(startup_latency_us),
         input_bytes_(input_bytes),
@@ -58,7 +58,8 @@ class BenchmarkResults {
         inference_time_us_(inference_time_us),
         init_mem_usage_(init_mem_usage),
         overall_mem_usage_(overall_mem_usage),
-        peak_mem_mb_(peak_mem_mb) {}
+        peak_mem_mb_(peak_mem_mb),
+        batch_size_(batch_size) {}
 
   const double model_size_mb() const { return model_size_mb_; }
   tensorflow::StatWithPercentiles<int64_t> inference_time_us() const {
@@ -74,6 +75,16 @@ class BenchmarkResults {
                            inference_time_us_.sum();
     return bytes_per_sec / (1024.0 * 1024.0);
   }
+
+  // Inference throughput in frames per second (FPS).
+  // throughput_fps = batch_size * 1000 / avg_latency_ms
+  double throughput_fps() const {
+    double avg_latency_ms = inference_time_us_.avg() / 1000.0;
+    if (avg_latency_ms <= 0) return 0.0;
+    return static_cast<double>(batch_size_) * 1000.0 / avg_latency_ms;
+  }
+
+  int32_t batch_size() const { return batch_size_; }
 
   const profiling::memory::MemoryUsage& init_mem_usage() const {
     return init_mem_usage_;
@@ -96,6 +107,7 @@ class BenchmarkResults {
   // platform.
   float peak_mem_mb_ =
       profiling::memory::MemoryUsageMonitor::kInvalidMemUsageMB;
+  int32_t batch_size_ = 1;
 };
 
 class BenchmarkListener {
