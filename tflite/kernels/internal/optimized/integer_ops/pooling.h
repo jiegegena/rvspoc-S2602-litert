@@ -259,16 +259,14 @@ inline bool AveragePool(const PoolParams& params,
               {
                 size_t vl;
                 for (; channel < tranche_depth; channel += vl) {
-                  vl = __riscv_vsetvl_e8m4(tranche_depth - channel);
-                  vint8m4_t input_reg = __riscv_vle8_v_i8m4(input_channel_ptr, vl);
+                  vl = __riscv_vsetvl_e32m4(tranche_depth - channel);
+                  vint8m1_t input_reg = __riscv_vle8_v_i8m1(input_channel_ptr, vl);
                   input_channel_ptr += vl;
-                  // Widen s8 to s16
-                  vint16m8_t input_s16 = __riscv_vsext_vf2_i16m8(input_reg, vl);
-                  // Truncate to m2 for widening add compatibility
-                  vint16m2_t input_s16_lo = __riscv_vlmul_trunc_v_i16m8_i16m2(input_s16);
+                  // Widen s8 -> s16 -> s32 for widening add
+                  vint16m2_t input_s16 = __riscv_vsext_vf2_i16m2(input_reg, vl);
                   // Load s32 accumulator and widen-accumulate s16 -> s32
                   vint32m4_t acc_reg = __riscv_vle32_v_i32m4(acc + channel, vl);
-                  acc_reg = __riscv_vwadd_wv_i32m4(acc_reg, input_s16_lo, vl);
+                  acc_reg = __riscv_vwadd_wv_i32m4(acc_reg, input_s16, vl);
                   __riscv_vse32_v_i32m4(acc + channel, acc_reg, vl);
                 }
               }
