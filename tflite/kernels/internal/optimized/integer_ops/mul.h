@@ -24,8 +24,39 @@ limitations under the License.
 #include "tflite/kernels/internal/optimized/cpu_check.h"
 #include "tflite/kernels/internal/optimized/neon_check.h"
 #include "tflite/kernels/internal/optimized/optimized_ops.h"
+#include "tflite/kernels/internal/optimized/rvv_check.h"
 #include "tflite/kernels/internal/reference/integer_ops/mul.h"
 #include "tflite/kernels/internal/types.h"
+
+#ifdef USE_RVV
+namespace tflite {
+namespace optimized_rvv {
+
+// Equivalent to NEON vqrdmulhq_n_s32 for int32m4:
+// Computes high32(a * b * 2 + 2^30) >> 31 using 64-bit intermediate.
+inline vint32m4_t RvvVqrdmulhScalar_i32m4(vint32m4_t a, int32_t b,
+                                           size_t vl) {
+  vint64m8_t prod = __riscv_vwmul_vx_i64m8(a, b, vl);
+  prod = __riscv_vsll_vx_i64m8(prod, 1, vl);
+  prod = __riscv_vadd_vx_i64m8(prod, static_cast<int64_t>(1) << 30, vl);
+  return __riscv_vnsra_wx_i32m4(prod, 31, vl);
+}
+
+// Equivalent to gemmlowp::RoundingDivideByPOT(x, exponent) for int32m4.
+inline vint32m4_t RvvRoundingDivideByPOT_i32m4(vint32m4_t x, int exponent,
+                                                size_t vl) {
+  if (exponent > 0) {
+    vint32m4_t rounding = __riscv_vsra_vx_i32m4(x, exponent - 1, vl);
+    rounding = __riscv_vand_vx_i32m4(rounding, 1, vl);
+    vint32m4_t result = __riscv_vsra_vx_i32m4(x, exponent, vl);
+    return __riscv_vadd_vv_i32m4(result, rounding, vl);
+  }
+  return x;
+}
+
+}  // namespace optimized_rvv
+}  // namespace tflite
+#endif  // USE_RVV
 
 namespace tflite {
 namespace optimized_integer_ops {
@@ -122,6 +153,73 @@ inline void MulElementwise(int size, const ArithmeticParams& params,
   }
 #endif  // NEON
 
+#ifdef USE_RVV
+  // RVV optimized path: LMUL=1 with vsetvl auto-adapts to VLEN.
+  // VLEN=128: 16 elements/iter; VLEN=256: 32 elements/iter.
+  {
+    const int8_t output_activation_min = params.quantized_activation_min;
+    const int8_t output_activation_max = params.quantized_activation_max;
+    const int left_shift = std::max(0, params.output_shift);
+    const int right_shift = std::max(0, -params.output_shift);
+
+    for (; i < size;) {
+      const size_t vl = __riscv_vsetvl_e8m1(size - i);
+
+      // Load int8 inputs
+      vint8m1_t v_in1_8 = __riscv_vle8_v_i8m1(input1_data + i, vl);
+      vint8m1_t v_in2_8 = __riscv_vle8_v_i8m1(input2_data + i, vl);
+
+      // Widen int8 → int16
+      vint16m2_t v_in1_16 = __riscv_vsext_vf2_i16m2(v_in1_8, vl);
+      vint16m2_t v_in2_16 = __riscv_vsext_vf2_i16m2(v_in2_8, vl);
+
+      // Add input offsets
+      v_in1_16 = __riscv_vadd_vx_i16m2(
+          v_in1_16, static_cast<int16_t>(params.input1_offset), vl);
+      v_in2_16 = __riscv_vadd_vx_i16m2(
+          v_in2_16, static_cast<int16_t>(params.input2_offset), vl);
+
+      // Widening multiply: int16 * int16 → int32
+      vint32m4_t v_prod = __riscv_vwmul_vv_i32m4(v_in1_16, v_in2_16, vl);
+
+      // Left shift
+      v_prod = __riscv_vsll_vx_i32m4(v_prod, left_shift, vl);
+
+      // Multiply by output multiplier: qrdmulh(prod, multiplier)
+      vint32m4_t v_out = optimized_rvv::RvvVqrdmulhScalar_i32m4(
+          v_prod, params.output_multiplier, vl);
+
+      // Rounding divide by power of 2
+      v_out = optimized_rvv::RvvRoundingDivideByPOT_i32m4(
+          v_out, right_shift, vl);
+
+      // Add output offset
+      v_out = __riscv_vadd_vx_i32m4(v_out, params.output_offset, vl);
+
+      // Clamp to int16 range, narrow int32 → int16
+      v_out = __riscv_vmin_vx_i32m4(v_out, 32767, vl);
+      v_out = __riscv_vmax_vx_i32m4(v_out, -32768, vl);
+      vuint32m4_t v_out_u32 = __riscv_vreinterpret_v_i32m4_u32m4(v_out);
+      vint16m2_t v_out_16 = __riscv_vreinterpret_v_u16m2_i16m2(
+          __riscv_vnsrl_wx_u16m2(v_out_u32, 0, vl));
+
+      // Clamp to int8 range
+      v_out_16 = __riscv_vmin_vx_i16m2(
+          v_out_16, static_cast<int16_t>(output_activation_max), vl);
+      v_out_16 = __riscv_vmax_vx_i16m2(
+          v_out_16, static_cast<int16_t>(output_activation_min), vl);
+
+      // Narrow int16 → int8 via unsigned clip with truncation rounding
+      vuint16m2_t v_out_u16 = __riscv_vreinterpret_v_i16m2_u16m2(v_out_16);
+      vint8m1_t v_out_8 = __riscv_vreinterpret_v_u8m1_i8m1(
+          __riscv_vnclipu_wx_u8m1(v_out_u16, 0, __RISCV_VXRM_RDN, vl));
+      __riscv_vse8_v_i8m1(output_data + i, v_out_8, vl);
+
+      i += vl;
+    }
+  }
+#endif  // USE_RVV
+
   for (; i < size; ++i) {
     const int32 input1_val = params.input1_offset + input1_data[i];
     const int32 input2_val = params.input2_offset + input2_data[i];
@@ -214,6 +312,69 @@ inline void MulSimpleBroadcast(int size, const ArithmeticParams& params,
     vst1q_s8(output_data + i, clamped);
   }
 #endif  // NEON
+
+#ifdef USE_RVV
+  // RVV optimized path: LMUL=1 with vsetvl auto-adapts to VLEN.
+  // Pre-computes scalar input1 contribution, then vectorizes input2.
+  {
+    const int8_t output_activation_min = params.quantized_activation_min;
+    const int8_t output_activation_max = params.quantized_activation_max;
+    const int left_shift = std::max(0, params.output_shift);
+    const int right_shift = std::max(0, -params.output_shift);
+
+    for (; i < size;) {
+      const size_t vl = __riscv_vsetvl_e8m1(size - i);
+
+      // Load int8 input2
+      vint8m1_t v_in2_8 = __riscv_vle8_v_i8m1(input2_data + i, vl);
+
+      // Widen int8 → int16
+      vint16m2_t v_in2_16 = __riscv_vsext_vf2_i16m2(v_in2_8, vl);
+
+      // Add input2 offset
+      v_in2_16 = __riscv_vadd_vx_i16m2(
+          v_in2_16, static_cast<int16_t>(params.input2_offset), vl);
+
+      // Widening multiply: scalar input1_val * int16 → int32
+      vint32m4_t v_prod = __riscv_vwmul_vx_i32m4(v_in2_16, input1_val, vl);
+
+      // Left shift
+      v_prod = __riscv_vsll_vx_i32m4(v_prod, left_shift, vl);
+
+      // Multiply by output multiplier: qrdmulh(prod, multiplier)
+      vint32m4_t v_out = optimized_rvv::RvvVqrdmulhScalar_i32m4(
+          v_prod, params.output_multiplier, vl);
+
+      // Rounding divide by power of 2
+      v_out = optimized_rvv::RvvRoundingDivideByPOT_i32m4(
+          v_out, right_shift, vl);
+
+      // Add output offset
+      v_out = __riscv_vadd_vx_i32m4(v_out, params.output_offset, vl);
+
+      // Clamp to int16 range, narrow int32 → int16
+      v_out = __riscv_vmin_vx_i32m4(v_out, 32767, vl);
+      v_out = __riscv_vmax_vx_i32m4(v_out, -32768, vl);
+      vuint32m4_t v_out_u32 = __riscv_vreinterpret_v_i32m4_u32m4(v_out);
+      vint16m2_t v_out_16 = __riscv_vreinterpret_v_u16m2_i16m2(
+          __riscv_vnsrl_wx_u16m2(v_out_u32, 0, vl));
+
+      // Clamp to int8 range
+      v_out_16 = __riscv_vmin_vx_i16m2(
+          v_out_16, static_cast<int16_t>(output_activation_max), vl);
+      v_out_16 = __riscv_vmax_vx_i16m2(
+          v_out_16, static_cast<int16_t>(output_activation_min), vl);
+
+      // Narrow int16 → int8 via unsigned clip with truncation rounding
+      vuint16m2_t v_out_u16 = __riscv_vreinterpret_v_i16m2_u16m2(v_out_16);
+      vint8m1_t v_out_8 = __riscv_vreinterpret_v_u8m1_i8m1(
+          __riscv_vnclipu_wx_u8m1(v_out_u16, 0, __RISCV_VXRM_RDN, vl));
+      __riscv_vse8_v_i8m1(output_data + i, v_out_8, vl);
+
+      i += vl;
+    }
+  }
+#endif  // USE_RVV
 
   for (; i < size; ++i) {
     const int32 input2_val = params.input2_offset + input2_data[i];

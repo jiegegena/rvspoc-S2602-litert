@@ -21,8 +21,40 @@ limitations under the License.
 #include "tflite/kernels/internal/common.h"
 #include "tflite/kernels/internal/compatibility.h"
 #include "tflite/kernels/internal/optimized/avx2_quantization_utils.h"
+#include "tflite/kernels/internal/optimized/rvv_check.h"
 #include "tflite/kernels/internal/reference/sub.h"
 #include "tflite/kernels/internal/types.h"
+
+#ifdef USE_RVV
+namespace tflite {
+namespace optimized_rvv {
+
+// Equivalent to NEON vqrdmulhq_n_s32 for int32m4:
+// Computes high32(a * b * 2 + 2^30) >> 31 using 64-bit intermediate.
+// This matches the Q31 fixed-point doubling multiply-high with rounding.
+inline vint32m4_t RvvVqrdmulhScalar_i32m4(vint32m4_t a, int32_t b,
+                                           size_t vl) {
+  vint64m8_t prod = __riscv_vwmul_vx_i64m8(a, b, vl);
+  prod = __riscv_vsll_vx_i64m8(prod, 1, vl);
+  prod = __riscv_vadd_vx_i64m8(prod, static_cast<int64_t>(1) << 30, vl);
+  return __riscv_vnsra_wx_i32m4(prod, 31, vl);
+}
+
+// Equivalent to gemmlowp::RoundingDivideByPOT(x, exponent) for int32m4.
+inline vint32m4_t RvvRoundingDivideByPOT_i32m4(vint32m4_t x, int exponent,
+                                                size_t vl) {
+  if (exponent > 0) {
+    vint32m4_t rounding = __riscv_vsra_vx_i32m4(x, exponent - 1, vl);
+    rounding = __riscv_vand_vx_i32m4(rounding, 1, vl);
+    vint32m4_t result = __riscv_vsra_vx_i32m4(x, exponent, vl);
+    return __riscv_vadd_vv_i32m4(result, rounding, vl);
+  }
+  return x;
+}
+
+}  // namespace optimized_rvv
+}  // namespace tflite
+#endif  // USE_RVV
 
 namespace tflite {
 namespace optimized_integer_ops {
@@ -97,6 +129,60 @@ inline void SubElementwiseInt16(int size, const ArithmeticParams& params,
     avx2_utils::CastInt32ToInt16AndStore(output_data + i + 8, s2);
   }
 #endif  // __AVX2__
+
+#ifdef USE_RVV
+  // RVV optimized path: LMUL=2 with vsetvl auto-adapts to VLEN.
+  // VLEN=128: 16 elements/iter; VLEN=256: 32 elements/iter.
+  {
+    const int16_t output_activation_min =
+        static_cast<int16_t>(params.quantized_activation_min);
+    const int16_t output_activation_max =
+        static_cast<int16_t>(params.quantized_activation_max);
+
+    const int input1_left_shift = params.left_shift + params.input1_shift;
+    const int input2_left_shift = params.left_shift + params.input2_shift;
+
+    for (; i < size;) {
+      const size_t vl = __riscv_vsetvl_e16m2(size - i);
+
+      vint16m2_t v_in1_16 = __riscv_vle16_v_i16m2(input1_data + i, vl);
+      vint16m2_t v_in2_16 = __riscv_vle16_v_i16m2(input2_data + i, vl);
+
+      vint32m4_t v_in1_lo = __riscv_vsext_vf2_i32m4(v_in1_16, vl);
+      vint32m4_t v_in2_lo = __riscv_vsext_vf2_i32m4(v_in2_16, vl);
+
+      v_in1_lo = __riscv_vadd_vx_i32m4(v_in1_lo, params.input1_offset, vl);
+      v_in2_lo = __riscv_vadd_vx_i32m4(v_in2_lo, params.input2_offset, vl);
+
+      // Left shift
+      v_in1_lo = __riscv_vsll_vx_i32m4(v_in1_lo, input1_left_shift, vl);
+      v_in2_lo = __riscv_vsll_vx_i32m4(v_in2_lo, input2_left_shift, vl);
+
+      vint32m4_t v_scaled1 = optimized_rvv::RvvVqrdmulhScalar_i32m4(
+          v_in1_lo, params.input1_multiplier, vl);
+      vint32m4_t v_scaled2 = optimized_rvv::RvvVqrdmulhScalar_i32m4(
+          v_in2_lo, params.input2_multiplier, vl);
+
+      vint32m4_t v_diff = __riscv_vsub_vv_i32m4(v_scaled1, v_scaled2, vl);
+
+      vint32m4_t v_out = optimized_rvv::RvvVqrdmulhScalar_i32m4(
+          v_diff, params.output_multiplier, vl);
+
+      v_out = optimized_rvv::RvvRoundingDivideByPOT_i32m4(
+          v_out, -params.output_shift, vl);
+
+      v_out = __riscv_vadd_vx_i32m4(v_out, params.output_offset, vl);
+
+      v_out = __riscv_vmin_vx_i32m4(v_out, static_cast<int32_t>(output_activation_max), vl);
+      v_out = __riscv_vmax_vx_i32m4(v_out, static_cast<int32_t>(output_activation_min), vl);
+
+      vuint32m4_t v_out_u32 = __riscv_vreinterpret_v_i32m4_u32m4(v_out);
+      vint16m2_t v_out_16 = __riscv_vreinterpret_v_u16m2_i16m2(
+          __riscv_vnsrl_wx_u16m2(v_out_u32, 0, vl));
+      __riscv_vse16_v_i16m2(output_data + i, v_out_16, vl);
+    }
+  }
+#endif  // USE_RVV
 
   for (; i < size; ++i) {
     const int32_t input1_val = params.input1_offset + input1_data[i];
