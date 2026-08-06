@@ -25,11 +25,53 @@ limitations under the License.
 #include "tflite/kernels/cpu_backend_threadpool.h"
 #include "tflite/kernels/internal/optimized/optimized_ops_utils.h"
 #include "tflite/kernels/internal/optimized/reduce_utils.h"
+#include "tflite/kernels/internal/optimized/rvv_check.h"
 #include "tflite/kernels/internal/reduce_common.h"
 #include "tflite/kernels/internal/reference/reduce.h"
 #include "tflite/kernels/internal/runtime_shape.h"
 #include "tflite/kernels/internal/types.h"
 #include "tflite/kernels/kernel_util.h"
+
+#ifdef USE_RVV
+namespace tflite {
+namespace optimized_rvv {
+
+// Equivalent to NEON vqrdmulhq_n_s32 for int32m4:
+// Computes high32(a * b * 2 + 2^30) >> 31 using 64-bit intermediate.
+inline vint32m4_t RvvVqrdmulhScalar_i32m4(vint32m4_t a, int32_t b,
+                                           size_t vl) {
+  vint64m8_t prod = __riscv_vwmul_vx_i64m8(a, b, vl);
+  prod = __riscv_vsll_vx_i64m8(prod, 1, vl);
+  prod = __riscv_vadd_vx_i64m8(prod, static_cast<int64_t>(1) << 30, vl);
+  return __riscv_vnsra_wx_i32m4(prod, 31, vl);
+}
+
+// Equivalent to gemmlowp::RoundingDivideByPOT(x, exponent) for int32m4.
+inline vint32m4_t RvvRoundingDivideByPOT_i32m4(vint32m4_t x, int exponent,
+                                                size_t vl) {
+  if (exponent > 0) {
+    vint32m4_t rounding = __riscv_vsra_vx_i32m4(x, exponent - 1, vl);
+    rounding = __riscv_vand_vx_i32m4(rounding, 1, vl);
+    vint32m4_t result = __riscv_vsra_vx_i32m4(x, exponent, vl);
+    return __riscv_vadd_vv_i32m4(result, rounding, vl);
+  }
+  return x;
+}
+
+// Equivalent to NEON MultiplyByQuantizedMultiplier4Rows for int32m4.
+inline vint32m4_t RvvMultiplyByQuantizedMultiplier_i32m4(
+    vint32m4_t x, int32_t multiplier, int shift, size_t vl) {
+  const int left_shift = std::max(shift, 0);
+  const int right_shift = std::min(shift, 0);
+  x = __riscv_vsll_vx_i32m4(x, left_shift, vl);
+  x = RvvVqrdmulhScalar_i32m4(x, multiplier, vl);
+  x = RvvRoundingDivideByPOT_i32m4(x, -right_shift, vl);
+  return x;
+}
+
+}  // namespace optimized_rvv
+}  // namespace tflite
+#endif  // USE_RVV
 
 namespace tflite {
 namespace optimized_ops {
@@ -138,6 +180,54 @@ inline void MeanImpl(const tflite::MeanParams& op_params,
       vst1q_u8(output_data_ptr, combined_output);
     }
 #endif  // USE_NEON
+
+#ifdef USE_RVV
+    // RVV optimized path: LMUL=1 with vsetvl auto-adapts to VLEN.
+    // VLEN=128: 16 elements/iter; VLEN=256: 32 elements/iter.
+    for (; out_d < end_depth;) {
+      const size_t vl = __riscv_vsetvl_e8m1(end_depth - out_d);
+
+      // Initialize int32 accumulators to zero
+      vint32m4_t v_acc = __riscv_vmv_v_x_i32m4(0, vl);
+
+      // Accumulate over input_height × input_width
+      for (int in_h = 0; in_h < input_height; ++in_h) {
+        for (int in_w = 0; in_w < input_width; ++in_w) {
+          const uint8_t* input_data_ptr =
+              input_data + Offset(input_shape, out_b, in_h, in_w, out_d);
+          vuint8m1_t v_in = __riscv_vle8_v_u8m1(input_data_ptr, vl);
+          // Widen uint8 → uint16 → uint32, reinterpret as int32
+          vuint16m2_t v_in_16 = __riscv_vzext_vf2_u16m2(v_in, vl);
+          vuint32m4_t v_in_32 = __riscv_vzext_vf2_u32m4(v_in_16, vl);
+          vint32m4_t v_in_s32 = __riscv_vreinterpret_v_u32m4_i32m4(v_in_32);
+          v_acc = __riscv_vadd_vv_i32m4(v_acc, v_in_s32, vl);
+        }
+      }
+
+      // Apply quantized multiplier: left_shift → qrdmulh → rounding_divide
+      v_acc = optimized_rvv::RvvMultiplyByQuantizedMultiplier_i32m4(
+          v_acc, multiplier, shift, vl);
+
+      // Add bias
+      v_acc = __riscv_vadd_vx_i32m4(v_acc, bias, vl);
+
+      // Clamp to uint8 range [0, 255]
+      v_acc = __riscv_vmin_vx_i32m4(v_acc, kMaxValue, vl);
+      v_acc = __riscv_vmax_vx_i32m4(v_acc, kMinValue, vl);
+
+      // Narrow int32 → uint16 → uint8
+      vuint32m4_t v_out_u32 = __riscv_vreinterpret_v_i32m4_u32m4(v_acc);
+      vuint16m2_t v_out_16 = __riscv_vnsrl_wx_u16m2(v_out_u32, 0, vl);
+      vuint8m1_t v_out_8 = __riscv_vnclipu_wx_u8m1(
+          v_out_16, 0, __RISCV_VXRM_RDN, vl);
+
+      uint8_t* output_data_ptr =
+          output_data + Offset(output_shape, out_b, 0, 0, out_d);
+      __riscv_vse8_v_u8m1(output_data_ptr, v_out_8, vl);
+
+      out_d += vl;
+    }
+#endif  // USE_RVV
 
     for (; out_d < end_depth; ++out_d) {
       int acc = 0;

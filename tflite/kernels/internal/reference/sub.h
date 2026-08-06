@@ -24,6 +24,7 @@ limitations under the License.
 #include "ruy/profiler/instrumentation.h"  // from @ruy
 #include "tflite/kernels/internal/common.h"
 #include "tflite/kernels/internal/compatibility.h"
+#include "tflite/kernels/internal/optimized/rvv_check.h"
 #include "tflite/kernels/internal/types.h"
 
 namespace tflite {
@@ -82,6 +83,18 @@ struct SubImpl<int32_t> {
       vst1q_s32(&output_data[c], vres);
     }
 #endif
+#ifdef USE_RVV
+    for (; c < size;) {
+      size_t vl = __riscv_vsetvl_e32m4(size - c);
+      vint32m4_t va = __riscv_vmv_v_x_i32m4(input1_data[0], vl);
+      vint32m4_t vb = __riscv_vle32_v_i32m4(&input2_data[c], vl);
+      vint32m4_t vres = __riscv_vsub_vv_i32m4(va, vb, vl);
+      vres = __riscv_vmax_vx_i32m4(vres, activation_min, vl);
+      vres = __riscv_vmin_vx_i32m4(vres, activation_max, vl);
+      __riscv_vse32_v_i32m4(&output_data[c], vres, vl);
+      c += vl;
+    }
+#endif
     for (; c < size; ++c) {
       output_data[c] = binary_func(input1_data[0], input2_data[c], params);
     }
@@ -107,6 +120,18 @@ struct SubImpl<int32_t> {
       vst1q_s32(&output_data[c], vres);
     }
 #endif
+#ifdef USE_RVV
+    for (; c < size;) {
+      size_t vl = __riscv_vsetvl_e32m4(size - c);
+      vint32m4_t va = __riscv_vle32_v_i32m4(&input1_data[c], vl);
+      vint32m4_t vb = __riscv_vmv_v_x_i32m4(input2_data[0], vl);
+      vint32m4_t vres = __riscv_vsub_vv_i32m4(va, vb, vl);
+      vres = __riscv_vmax_vx_i32m4(vres, activation_min, vl);
+      vres = __riscv_vmin_vx_i32m4(vres, activation_max, vl);
+      __riscv_vse32_v_i32m4(&output_data[c], vres, vl);
+      c += vl;
+    }
+#endif
     for (; c < size; ++c) {
       output_data[c] = binary_func(input1_data[c], input2_data[0], params);
     }
@@ -130,6 +155,18 @@ struct SubImpl<int32_t> {
       vres = vmaxq_s32(vmin, vres);
       vres = vminq_s32(vmax, vres);
       vst1q_s32(&output_data[c], vres);
+    }
+#endif
+#ifdef USE_RVV
+    for (; c < size;) {
+      size_t vl = __riscv_vsetvl_e32m4(size - c);
+      vint32m4_t va = __riscv_vle32_v_i32m4(&input1_data[c], vl);
+      vint32m4_t vb = __riscv_vle32_v_i32m4(&input2_data[c], vl);
+      vint32m4_t vres = __riscv_vsub_vv_i32m4(va, vb, vl);
+      vres = __riscv_vmax_vx_i32m4(vres, activation_min, vl);
+      vres = __riscv_vmin_vx_i32m4(vres, activation_max, vl);
+      __riscv_vse32_v_i32m4(&output_data[c], vres, vl);
+      c += vl;
     }
 #endif
     for (; c < size; ++c) {
