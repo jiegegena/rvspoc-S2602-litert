@@ -22,39 +22,9 @@ limitations under the License.
 #include "tflite/kernels/internal/compatibility.h"
 #include "tflite/kernels/internal/optimized/avx2_quantization_utils.h"
 #include "tflite/kernels/internal/optimized/rvv_check.h"
+#include "tflite/kernels/internal/optimized/rvv_utils.h"
 #include "tflite/kernels/internal/reference/sub.h"
 #include "tflite/kernels/internal/types.h"
-
-#ifdef USE_RVV
-namespace tflite {
-namespace optimized_rvv {
-
-// Equivalent to NEON vqrdmulhq_n_s32 for int32m4:
-// Computes high32(a * b * 2 + 2^30) >> 31 using 64-bit intermediate.
-// This matches the Q31 fixed-point doubling multiply-high with rounding.
-inline vint32m4_t RvvVqrdmulhScalar_i32m4(vint32m4_t a, int32_t b,
-                                           size_t vl) {
-  vint64m8_t prod = __riscv_vwmul_vx_i64m8(a, b, vl);
-  prod = __riscv_vsll_vx_i64m8(prod, 1, vl);
-  prod = __riscv_vadd_vx_i64m8(prod, static_cast<int64_t>(1) << 30, vl);
-  return __riscv_vnsra_wx_i32m4(prod, 31, vl);
-}
-
-// Equivalent to gemmlowp::RoundingDivideByPOT(x, exponent) for int32m4.
-inline vint32m4_t RvvRoundingDivideByPOT_i32m4(vint32m4_t x, int exponent,
-                                                size_t vl) {
-  if (exponent > 0) {
-    vint32m4_t rounding = __riscv_vsra_vx_i32m4(x, exponent - 1, vl);
-    rounding = __riscv_vand_vx_i32m4(rounding, 1, vl);
-    vint32m4_t result = __riscv_vsra_vx_i32m4(x, exponent, vl);
-    return __riscv_vadd_vv_i32m4(result, rounding, vl);
-  }
-  return x;
-}
-
-}  // namespace optimized_rvv
-}  // namespace tflite
-#endif  // USE_RVV
 
 namespace tflite {
 namespace optimized_integer_ops {

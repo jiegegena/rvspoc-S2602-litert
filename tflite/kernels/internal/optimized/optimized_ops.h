@@ -68,6 +68,8 @@ limitations under the License.
 #define TFLITE_SOFTMAX_USE_UINT16_LUT
 #endif
 
+#include "tflite/kernels/internal/optimized/rvv_utils.h"
+
 namespace tflite {
 namespace optimized_ops {
 
@@ -3820,6 +3822,22 @@ inline int FindMaxValue(int size, const uint8_t* input_data, uint8_t offset) {
     max_val_dup = vmaxq_u8(input_value, max_val_dup);
   }
   max_val = std::max(max_val, static_cast<int32_t>(vmaxvq_u8(max_val_dup)));
+#elif defined(USE_RVV)
+  {
+    vuint8m1_t v_max = __riscv_vmv_v_x_u8m1(max_val, __riscv_vsetvlmax_e8m1());
+    for (; j < size;) {
+      size_t vl = __riscv_vsetvl_e8m1(size - j);
+      vuint8m1_t v_in = __riscv_vle8_v_u8m1(input_data + j, vl);
+      v_in = __riscv_vxor_vx_u8m1(v_in, offset, vl);
+      v_max = __riscv_vmaxu_vv_u8m1(v_max, v_in, vl);
+      j += vl;
+    }
+    // Reduce vector max to scalar
+    size_t vl_max = __riscv_vsetvlmax_e8m1();
+    vuint8m1_t v_zero = __riscv_vmv_v_x_u8m1(0, vl_max);
+    v_max = __riscv_vredmaxu_vs_u8m1_u8m1(v_max, v_zero, vl_max);
+    max_val = std::max(max_val, static_cast<int32_t>(__riscv_vmv_x_s_u8m1_u8(v_max)));
+  }
 #endif
 
   for (; j < size; ++j) {
@@ -3942,6 +3960,25 @@ inline void SoftmaxInt8LUT(const SoftmaxParams& params,
     sum_exp += temp;
 
 #endif
+#ifdef USE_RVV
+    // RVV path: LUT lookup is scalar, vectorize sum accumulation.
+    for (; sum_j < last_dim;) {
+      size_t vl = __riscv_vsetvl_e32m4(last_dim - sum_j);
+      int32_t exp_buffer[32];
+      for (size_t k = 0; k < vl; ++k) {
+        const uint8_t index =
+            (input_data_uint[sum_j + k] ^ offset) + table_offset;
+        const uint8_t part1 = params.uint8_table1[index];
+        const uint8_t part2 = params.uint8_table2[index];
+        exp_buffer[k] = (part1 << 8) + part2;
+      }
+      vint32m4_t v_exp = __riscv_vle32_v_i32m4(exp_buffer, vl);
+      vint32m1_t v_zero = __riscv_vmv_v_x_i32m1(0, 1);
+      vint32m1_t v_sum = __riscv_vredsum_vs_i32m4_i32m1(v_exp, v_zero, vl);
+      sum_exp += __riscv_vmv_x_s_i32m1_i32(v_sum);
+      sum_j += vl;
+    }
+#else
     for (; sum_j < last_dim; ++sum_j) {
       const uint8_t index = (input_data_uint[sum_j] ^ offset) + table_offset;
 
@@ -3949,6 +3986,7 @@ inline void SoftmaxInt8LUT(const SoftmaxParams& params,
       uint8_t part2 = params.uint8_table2[index];
       sum_exp += ((part1 << 8) + part2);
     }
+#endif
 
     const float inv_sum_exp = 1.0f / (sum_exp * params.scale);
 
@@ -4008,6 +4046,47 @@ inline void SoftmaxInt8LUT(const SoftmaxParams& params,
       StoreValue(temp_val, output_data + j);
     }
 #endif
+#ifdef USE_RVV
+    // RVV path: LUT lookup is scalar, vectorize multiply+add+clamp+store.
+    for (; j < last_dim;) {
+      size_t vl = __riscv_vsetvl_e32m4(last_dim - j);
+      // Collect exp_values scalar into a buffer (max vl=32 for VLEN=256)
+      int32_t exp_buffer[32];
+      for (size_t k = 0; k < vl; ++k) {
+        const uint8_t index =
+            (input_data_uint[j + k] ^ offset) + table_offset;
+        const uint8_t part1 = params.uint8_table1[index];
+        const uint8_t part2 = params.uint8_table2[index];
+        exp_buffer[k] = (part1 << 8) + part2;
+      }
+      // Vectorize multiply+add+clamp+store
+      vint32m4_t v_exp = __riscv_vle32_v_i32m4(exp_buffer, vl);
+      vint32m4_t v_out = optimized_rvv::RvvMultiplyByQuantizedMultiplier_i32m4(
+          v_exp, multiplier, shift, vl);
+      v_out = __riscv_vadd_vx_i32m4(v_out, params.zero_point, vl);
+      v_out = __riscv_vmin_vx_i32m4(v_out, clamp_max, vl);
+      v_out = __riscv_vmax_vx_i32m4(v_out, clamp_min, vl);
+      // Narrow int32 → int16 → int8/uint8 and store
+      vuint32m4_t v_out_u32 = __riscv_vreinterpret_v_i32m4_u32m4(v_out);
+      vuint16m2_t v_out_16 = __riscv_vnsrl_wx_u16m2(v_out_u32, 0, vl);
+      if (std::is_same<Out, int8_t>::value) {
+        vint16m2_t v_out_s16 = __riscv_vreinterpret_v_u16m2_i16m2(v_out_16);
+        v_out_s16 = __riscv_vmin_vx_i16m2(v_out_s16, 127, vl);
+        v_out_s16 = __riscv_vmax_vx_i16m2(v_out_s16, -128, vl);
+        vuint16m2_t v_out_u16 =
+            __riscv_vreinterpret_v_i16m2_u16m2(v_out_s16);
+        vint8m1_t v_out_8 = __riscv_vreinterpret_v_u8m1_i8m1(
+            __riscv_vnclipu_wx_u8m1(v_out_u16, 0, __RISCV_VXRM_RDN, vl));
+        __riscv_vse8_v_i8m1(
+            reinterpret_cast<int8_t*>(output_data + j), v_out_8, vl);
+      } else {
+        vuint8m1_t v_out_8 = __riscv_vnclipu_wx_u8m1(
+            v_out_16, 0, __RISCV_VXRM_RDN, vl);
+        __riscv_vse8_v_u8m1(output_data + j, v_out_8, vl);
+      }
+      j += vl;
+    }
+#else
     for (; j < last_dim; ++j) {
       const uint8_t index = (input_data_uint[j] ^ offset) + table_offset;
       const uint8_t part1 = params.uint8_table1[index];
@@ -4019,6 +4098,7 @@ inline void SoftmaxInt8LUT(const SoftmaxParams& params,
       output_data[j] = static_cast<Out>(std::max(
           std::min(clamp_max, output_value + params.zero_point), clamp_min));
     }
+#endif
     input_data_uint += last_dim;
     output_data += last_dim;
   }
