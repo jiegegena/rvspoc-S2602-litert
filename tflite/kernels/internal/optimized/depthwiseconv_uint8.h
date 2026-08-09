@@ -1544,6 +1544,544 @@ struct QuantizedDepthwiseConvKernel<true, 0, 1> {
   }
 };
 
+// RVV specialization for strided/non-strided, variable input depth, multiplier=2.
+// Each input channel maps to 2 output channels.
+template <>
+struct QuantizedDepthwiseConvKernel<true, 0, 2> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    const int output_depth = input_depth * 2;
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int d = 0; d < input_depth; d++) {
+        // Load input value, widen, add offset.
+        const uint8_t in_u8 = input_ptr[d];
+        const int16_t in_s16 = static_cast<int16_t>(in_u8) + input_offset;
+        // Load 2 filter values for this input channel.
+        const uint8_t f0_u8 = filter_ptr[d * 2];
+        const uint8_t f1_u8 = filter_ptr[d * 2 + 1];
+        const int16_t f0_s16 = static_cast<int16_t>(f0_u8) + filter_offset;
+        const int16_t f1_s16 = static_cast<int16_t>(f1_u8) + filter_offset;
+        // Multiply-accumulate into int32.
+        acc_buffer_ptr[d * 2] += static_cast<int32_t>(in_s16) * f0_s16;
+        acc_buffer_ptr[d * 2 + 1] += static_cast<int32_t>(in_s16) * f1_s16;
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += output_depth;
+    }
+  }
+};
+
+// RVV specialization for non-strided, fixed depth=8, multiplier=1.
+// Vectorized using vsetvl_e8m1: LMUL chain m1→m2→m4, no vget needed.
+// Processes 2 pixels at a time, filter loaded once.
+template <>
+struct QuantizedDepthwiseConvKernel<false, 8, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    // vl=8: valid for LMUL=1 (≥8), LMUL=2 (≥8), LMUL=4 (≥8).
+    // Requires VLEN >= 64 (all practical RVV implementations).
+    const size_t vl = __riscv_vsetvl_e8m1(8);
+    // Load filter once, widen: u8(m1) → u16(m2) → i16(m2) + offset.
+    vuint8m1_t filter_u8 = __riscv_vle8_v_u8m1(filter_ptr, vl);
+    vint16m2_t filter_s16 = __riscv_vreinterpret_v_u16m2_i16m2(
+        __riscv_vzext_vf2_u16m2(filter_u8, vl));
+    filter_s16 = __riscv_vadd_vx_i16m2(filter_s16, filter_offset, vl);
+
+    int outp = 0;
+    for (; outp <= num_output_pixels - 2; outp += 2) {
+      // Pixel 0: load acc(i32,m4), input(u8,m1→i16,m2), wmac.
+      vint32m4_t acc0 = __riscv_vle32_v_i32m4(acc_buffer_ptr, vl);
+      vint16m2_t in0 = __riscv_vreinterpret_v_u16m2_i16m2(
+          __riscv_vzext_vf2_u16m2(__riscv_vle8_v_u8m1(input_ptr, vl), vl));
+      in0 = __riscv_vadd_vx_i16m2(in0, input_offset, vl);
+      acc0 = __riscv_vwmacc_vv_i32m4(acc0, in0, filter_s16, vl);
+      __riscv_vse32_v_i32m4(acc_buffer_ptr, acc0, vl);
+
+      // Pixel 1.
+      vint32m4_t acc1 = __riscv_vle32_v_i32m4(acc_buffer_ptr + 8, vl);
+      vint16m2_t in1 = __riscv_vreinterpret_v_u16m2_i16m2(
+          __riscv_vzext_vf2_u16m2(
+              __riscv_vle8_v_u8m1(input_ptr + input_ptr_increment, vl), vl));
+      in1 = __riscv_vadd_vx_i16m2(in1, input_offset, vl);
+      acc1 = __riscv_vwmacc_vv_i32m4(acc1, in1, filter_s16, vl);
+      __riscv_vse32_v_i32m4(acc_buffer_ptr + 8, acc1, vl);
+
+      input_ptr += 2 * input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+    for (; outp < num_output_pixels; outp++) {
+      vint32m4_t acc = __riscv_vle32_v_i32m4(acc_buffer_ptr, vl);
+      vint16m2_t in = __riscv_vreinterpret_v_u16m2_i16m2(
+          __riscv_vzext_vf2_u16m2(__riscv_vle8_v_u8m1(input_ptr, vl), vl));
+      in = __riscv_vadd_vx_i16m2(in, input_offset, vl);
+      acc = __riscv_vwmacc_vv_i32m4(acc, in, filter_s16, vl);
+      __riscv_vse32_v_i32m4(acc_buffer_ptr, acc, vl);
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+  }
+};
+
+// RVV specialization for non-strided, fixed depth=4, multiplier=1.
+// Scalar with loop unrolling: process 4 pixels/iter.
+template <>
+struct QuantizedDepthwiseConvKernel<false, 4, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[4];
+    for (int i = 0; i < 4; i++) {
+      f[i] = static_cast<int32_t>(
+          static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    }
+    int outp = 0;
+    for (; outp <= num_output_pixels - 4; outp += 4) {
+      for (int p = 0; p < 4; p++) {
+        const uint8_t* in = input_ptr + p * input_ptr_increment;
+        int32_t* acc = acc_buffer_ptr + p * 4;
+        for (int i = 0; i < 4; i++) {
+          acc[i] += (static_cast<int32_t>(
+              static_cast<int16_t>(in[i]) + input_offset)) * f[i];
+        }
+      }
+      input_ptr += 4 * input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+    for (; outp < num_output_pixels; outp++) {
+      for (int i = 0; i < 4; i++) {
+        acc_buffer_ptr[i] += (static_cast<int32_t>(
+            static_cast<int16_t>(input_ptr[i]) + input_offset)) * f[i];
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 4;
+    }
+  }
+};
+
+// RVV specialization for non-strided, fixed depth=2, multiplier=1.
+// Scalar with loop unrolling: process 4 pixels/iter.
+template <>
+struct QuantizedDepthwiseConvKernel<false, 2, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    const int32_t f0 = static_cast<int32_t>(
+        static_cast<int16_t>(filter_ptr[0]) + filter_offset);
+    const int32_t f1 = static_cast<int32_t>(
+        static_cast<int16_t>(filter_ptr[1]) + filter_offset);
+    int outp = 0;
+    for (; outp <= num_output_pixels - 4; outp += 4) {
+      const uint8_t* in0 = input_ptr;
+      const uint8_t* in1 = input_ptr + input_ptr_increment;
+      const uint8_t* in2 = input_ptr + 2 * input_ptr_increment;
+      const uint8_t* in3 = input_ptr + 3 * input_ptr_increment;
+      acc_buffer_ptr[0] += (static_cast<int32_t>(
+          static_cast<int16_t>(in0[0]) + input_offset)) * f0;
+      acc_buffer_ptr[1] += (static_cast<int32_t>(
+          static_cast<int16_t>(in0[1]) + input_offset)) * f1;
+      acc_buffer_ptr[2] += (static_cast<int32_t>(
+          static_cast<int16_t>(in1[0]) + input_offset)) * f0;
+      acc_buffer_ptr[3] += (static_cast<int32_t>(
+          static_cast<int16_t>(in1[1]) + input_offset)) * f1;
+      acc_buffer_ptr[4] += (static_cast<int32_t>(
+          static_cast<int16_t>(in2[0]) + input_offset)) * f0;
+      acc_buffer_ptr[5] += (static_cast<int32_t>(
+          static_cast<int16_t>(in2[1]) + input_offset)) * f1;
+      acc_buffer_ptr[6] += (static_cast<int32_t>(
+          static_cast<int16_t>(in3[0]) + input_offset)) * f0;
+      acc_buffer_ptr[7] += (static_cast<int32_t>(
+          static_cast<int16_t>(in3[1]) + input_offset)) * f1;
+      input_ptr += 4 * input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+    for (; outp < num_output_pixels; outp++) {
+      acc_buffer_ptr[0] += (static_cast<int32_t>(
+          static_cast<int16_t>(input_ptr[0]) + input_offset)) * f0;
+      acc_buffer_ptr[1] += (static_cast<int32_t>(
+          static_cast<int16_t>(input_ptr[1]) + input_offset)) * f1;
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 2;
+    }
+  }
+};
+
+// RVV specialization for non-strided, fixed depth=12, multiplier=1.
+// Scalar with loop unrolling.
+template <>
+struct QuantizedDepthwiseConvKernel<false, 12, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[12];
+    for (int i = 0; i < 12; i++) {
+      f[i] = static_cast<int32_t>(
+          static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    }
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int i = 0; i < 12; i++) {
+        acc_buffer_ptr[i] += (static_cast<int32_t>(
+            static_cast<int16_t>(input_ptr[i]) + input_offset)) * f[i];
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 12;
+    }
+  }
+};
+
+// RVV specialization for non-strided, fixed depth=4, multiplier=2.
+// Scalar: pre-expand filter, process 2 pixels/iter.
+template <>
+struct QuantizedDepthwiseConvKernel<false, 4, 2> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[8];
+    for (int i = 0; i < 8; i++) {
+      f[i] = static_cast<int32_t>(
+          static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    }
+    int outp = 0;
+    for (; outp <= num_output_pixels - 2; outp += 2) {
+      const uint8_t* in0 = input_ptr;
+      const uint8_t* in1 = input_ptr + input_ptr_increment;
+      for (int k = 0; k < 4; k++) {
+        int32_t in0_s = static_cast<int32_t>(
+            static_cast<int16_t>(in0[k]) + input_offset);
+        int32_t in1_s = static_cast<int32_t>(
+            static_cast<int16_t>(in1[k]) + input_offset);
+        acc_buffer_ptr[k * 2] += in0_s * f[k * 2];
+        acc_buffer_ptr[k * 2 + 1] += in0_s * f[k * 2 + 1];
+        acc_buffer_ptr[8 + k * 2] += in1_s * f[k * 2];
+        acc_buffer_ptr[8 + k * 2 + 1] += in1_s * f[k * 2 + 1];
+      }
+      input_ptr += 2 * input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+    for (; outp < num_output_pixels; outp++) {
+      for (int k = 0; k < 4; k++) {
+        int32_t in_s = static_cast<int32_t>(
+            static_cast<int16_t>(input_ptr[k]) + input_offset);
+        acc_buffer_ptr[k * 2] += in_s * f[k * 2];
+        acc_buffer_ptr[k * 2 + 1] += in_s * f[k * 2 + 1];
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+  }
+};
+
+// RVV: strided fixed-depth kernels (reuse non-strided logic).
+template <>
+struct QuantizedDepthwiseConvKernel<true, 8, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[8];
+    for (int i = 0; i < 8; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int i = 0; i < 8; i++)
+        acc_buffer_ptr[i] += (static_cast<int32_t>(static_cast<int16_t>(input_ptr[i]) + input_offset)) * f[i];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 4, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[4];
+    for (int i = 0; i < 4; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int i = 0; i < 4; i++)
+        acc_buffer_ptr[i] += (static_cast<int32_t>(static_cast<int16_t>(input_ptr[i]) + input_offset)) * f[i];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 4;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 2, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    const int32_t f0 = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[0]) + filter_offset);
+    const int32_t f1 = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[1]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      acc_buffer_ptr[0] += (static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset)) * f0;
+      acc_buffer_ptr[1] += (static_cast<int32_t>(static_cast<int16_t>(input_ptr[1]) + input_offset)) * f1;
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 2;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 16, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[16];
+    for (int i = 0; i < 16; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int i = 0; i < 16; i++)
+        acc_buffer_ptr[i] += (static_cast<int32_t>(static_cast<int16_t>(input_ptr[i]) + input_offset)) * f[i];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 12, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[12];
+    for (int i = 0; i < 12; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int i = 0; i < 12; i++)
+        acc_buffer_ptr[i] += (static_cast<int32_t>(static_cast<int16_t>(input_ptr[i]) + input_offset)) * f[i];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 12;
+    }
+  }
+};
+
+// RVV: depth=1 with various multipliers.
+template <>
+struct QuantizedDepthwiseConvKernel<true, 1, 2> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    const int32_t f0 = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[0]) + filter_offset);
+    const int32_t f1 = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[1]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset);
+      acc_buffer_ptr[0] += in * f0;
+      acc_buffer_ptr[1] += in * f1;
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 2;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 1, 4> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[4];
+    for (int i = 0; i < 4; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset);
+      for (int m = 0; m < 4; m++) acc_buffer_ptr[m] += in * f[m];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 4;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 1, 8> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[8];
+    for (int i = 0; i < 8; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset);
+      for (int m = 0; m < 8; m++) acc_buffer_ptr[m] += in * f[m];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 1, 16> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[16];
+    for (int i = 0; i < 16; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset);
+      for (int m = 0; m < 16; m++) acc_buffer_ptr[m] += in * f[m];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 1, 20> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[20];
+    for (int i = 0; i < 20; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset);
+      for (int m = 0; m < 20; m++) acc_buffer_ptr[m] += in * f[m];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 20;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<true, 1, 32> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[32];
+    for (int i = 0; i < 32; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset);
+      for (int m = 0; m < 32; m++) acc_buffer_ptr[m] += in * f[m];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 32;
+    }
+  }
+};
+
+// RVV: depth=2 with multiplier=2 and multiplier=8.
+template <>
+struct QuantizedDepthwiseConvKernel<false, 2, 2> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[4];
+    for (int i = 0; i < 4; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      int32_t in0 = static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset);
+      int32_t in1 = static_cast<int32_t>(static_cast<int16_t>(input_ptr[1]) + input_offset);
+      acc_buffer_ptr[0] += in0 * f[0]; acc_buffer_ptr[1] += in0 * f[1];
+      acc_buffer_ptr[2] += in1 * f[2]; acc_buffer_ptr[3] += in1 * f[3];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 4;
+    }
+  }
+};
+
+template <>
+struct QuantizedDepthwiseConvKernel<false, 2, 8> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[16];
+    for (int i = 0; i < 16; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      int32_t in0 = static_cast<int32_t>(static_cast<int16_t>(input_ptr[0]) + input_offset);
+      int32_t in1 = static_cast<int32_t>(static_cast<int16_t>(input_ptr[1]) + input_offset);
+      for (int m = 0; m < 8; m++) acc_buffer_ptr[m] += in0 * f[m];
+      for (int m = 0; m < 8; m++) acc_buffer_ptr[8 + m] += in1 * f[8 + m];
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+  }
+};
+
+// RVV: depth=4, multiplier=4.
+template <>
+struct QuantizedDepthwiseConvKernel<false, 4, 4> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[16];
+    for (int i = 0; i < 16; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int k = 0; k < 4; k++) {
+        int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[k]) + input_offset);
+        for (int m = 0; m < 4; m++) acc_buffer_ptr[k * 4 + m] += in * f[k * 4 + m];
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+  }
+};
+
+// RVV: depth=8, multiplier=2.
+template <>
+struct QuantizedDepthwiseConvKernel<true, 8, 2> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    int32_t f[16];
+    for (int i = 0; i < 16; i++)
+      f[i] = static_cast<int32_t>(static_cast<int16_t>(filter_ptr[i]) + filter_offset);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int k = 0; k < 8; k++) {
+        int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[k]) + input_offset);
+        acc_buffer_ptr[k * 2] += in * f[k * 2];
+        acc_buffer_ptr[k * 2 + 1] += in * f[k * 2 + 1];
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+  }
+};
+
+// RVV: variable depth, multiplier=3.
+template <>
+struct QuantizedDepthwiseConvKernel<true, 0, 3> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const uint8_t* input_ptr, int16_t input_offset,
+                  int input_ptr_increment, const uint8_t* filter_ptr,
+                  int16_t filter_offset, int32_t* acc_buffer_ptr) {
+    const int output_depth = input_depth * 3;
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int d = 0; d < input_depth; d++) {
+        int32_t in = static_cast<int32_t>(static_cast<int16_t>(input_ptr[d]) + input_offset);
+        acc_buffer_ptr[d * 3] += in * (static_cast<int32_t>(static_cast<int16_t>(filter_ptr[d * 3]) + filter_offset));
+        acc_buffer_ptr[d * 3 + 1] += in * (static_cast<int32_t>(static_cast<int16_t>(filter_ptr[d * 3 + 1]) + filter_offset));
+        acc_buffer_ptr[d * 3 + 2] += in * (static_cast<int32_t>(static_cast<int16_t>(filter_ptr[d * 3 + 2]) + filter_offset));
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += output_depth;
+    }
+  }
+};
+
 #endif  // USE_RVV
 
 // Accumulates the effect of one row of the filter, on a segment of one row
@@ -1856,9 +2394,34 @@ inline void DepthwiseConvGeneral(
 #endif  // USE_NEON
 
 #ifdef USE_RVV
+  // RVV kernels: fixed depth, non-strided (fastest).
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 8, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 4, 4)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 4, 2)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 4, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 2, 8)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 2, 2)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 2, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 12, 1)
+  // RVV kernels: fixed depth, strided.
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 8, 2)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 16, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 8, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 4, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 2, 1)
+  // RVV kernels: depth=1 with various multipliers.
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 32)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 20)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 16)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 8)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 4)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 2)
   // RVV kernels: variable input depth, most general.
+  // These use vsetvl to naturally handle any depth.
   // Note: kAllowStrided must be true when kFixedInputDepth==0 (static_assert).
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 3)
   TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 2)
 #endif  // USE_RVV
 
   // No matching fast kernel found, use slow fallback.
@@ -2063,6 +2626,22 @@ inline void DepthwiseConvGeneral(
           vst1_lane_u8(output_ptr + 2, res_u8, 2);
           vst1_lane_u8(output_ptr + 3, res_u8, 3);
           output_ptr += 4;
+        }
+#elif defined(USE_RVV)
+        // RVV requantization: fall back to scalar for correctness.
+        // The vmulh-based approach loses precision for output_shift < 0
+        // because it discards low 32 bits before adding rounding.
+        // This is NOT the performance bottleneck (accumulation is), so scalar is fine.
+        (void)shift_left;
+        (void)multiplier_power_of_two;
+        for (; i < num_output_values; i++) {
+          int32_t acc = acc_buffer[i];
+          acc = MultiplyByQuantizedMultiplier(acc, output_multiplier,
+                                              output_shift);
+          acc += output_offset;
+          acc = std::max(acc, output_activation_min);
+          acc = std::min(acc, output_activation_max);
+          *output_ptr++ = static_cast<uint8_t>(acc);
         }
 #endif  // USE_NEON/RVV
 

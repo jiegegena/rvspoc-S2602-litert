@@ -771,15 +771,38 @@ struct FloatDepthwiseConvKernel<true, 0, 1> {
   static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
                   const float* input_ptr, int input_ptr_increment,
                   const float* filter_ptr, float* acc_buffer_ptr) {
-    for (int outp = 0; outp < num_output_pixels; outp++) {
+    int outp = 0;
+    for (; outp <= num_output_pixels - 2; outp += 2) {
       size_t vl;
       for (int d = 0; d < input_depth; d += vl) {
-        vl = __riscv_vsetvl_e32m8(input_depth - d);
-        vfloat32m8_t input = __riscv_vle32_v_f32m8(input_ptr + d, vl);
-        vfloat32m8_t filter = __riscv_vle32_v_f32m8(filter_ptr + d, vl);
-        vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + d, vl);
-        acc = __riscv_vfmacc_vv_f32m8(acc, input, filter, vl);
-        __riscv_vse32_v_f32m8(acc_buffer_ptr + d, acc, vl);
+        vl = __riscv_vsetvl_e32m2(input_depth - d);
+        // Load filter once, reuse for both pixels
+        vfloat32m2_t filter = __riscv_vle32_v_f32m2(filter_ptr + d, vl);
+        // Pixel 0
+        vfloat32m2_t in0 = __riscv_vle32_v_f32m2(input_ptr + d, vl);
+        vfloat32m2_t acc0 = __riscv_vle32_v_f32m2(acc_buffer_ptr + d, vl);
+        acc0 = __riscv_vfmacc_vv_f32m2(acc0, in0, filter, vl);
+        __riscv_vse32_v_f32m2(acc_buffer_ptr + d, acc0, vl);
+        // Pixel 1
+        const float* in1_ptr = input_ptr + input_ptr_increment;
+        vfloat32m2_t in1 = __riscv_vle32_v_f32m2(in1_ptr + d, vl);
+        vfloat32m2_t acc1 = __riscv_vle32_v_f32m2(acc_buffer_ptr + input_depth + d, vl);
+        acc1 = __riscv_vfmacc_vv_f32m2(acc1, in1, filter, vl);
+        __riscv_vse32_v_f32m2(acc_buffer_ptr + input_depth + d, acc1, vl);
+      }
+      input_ptr += 2 * input_ptr_increment;
+      acc_buffer_ptr += 2 * input_depth;
+    }
+    // Handle remaining pixel
+    for (; outp < num_output_pixels; outp++) {
+      size_t vl;
+      for (int d = 0; d < input_depth; d += vl) {
+        vl = __riscv_vsetvl_e32m2(input_depth - d);
+        vfloat32m2_t input = __riscv_vle32_v_f32m2(input_ptr + d, vl);
+        vfloat32m2_t filter = __riscv_vle32_v_f32m2(filter_ptr + d, vl);
+        vfloat32m2_t acc = __riscv_vle32_v_f32m2(acc_buffer_ptr + d, vl);
+        acc = __riscv_vfmacc_vv_f32m2(acc, input, filter, vl);
+        __riscv_vse32_v_f32m2(acc_buffer_ptr + d, acc, vl);
       }
       input_ptr += input_ptr_increment;
       acc_buffer_ptr += input_depth;
@@ -788,6 +811,8 @@ struct FloatDepthwiseConvKernel<true, 0, 1> {
 };
 
 // RVV specialization for strided/non-strided, variable input depth, multiplier=2.
+// Uses strided loads/stores to process multiple input channels at once.
+// For each input channel, 2 output channels are produced (even/odd stride).
 template <>
 struct FloatDepthwiseConvKernel<true, 0, 2> {
   static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
@@ -795,17 +820,438 @@ struct FloatDepthwiseConvKernel<true, 0, 2> {
                   const float* filter_ptr, float* acc_buffer_ptr) {
     const int output_depth = input_depth * 2;
     for (int outp = 0; outp < num_output_pixels; outp++) {
-      for (int d = 0; d < input_depth; d++) {
-        float in_val = input_ptr[d];
-        size_t vl = __riscv_vsetvl_e32m8(2);
-        vfloat32m8_t filt = __riscv_vle32_v_f32m8(filter_ptr + d * 2, vl);
-        vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + d * 2, vl);
-        vfloat32m8_t in_dup = __riscv_vfmv_v_f_f32m8(in_val, vl);
-        acc = __riscv_vfmacc_vv_f32m8(acc, in_dup, filt, vl);
-        __riscv_vse32_v_f32m8(acc_buffer_ptr + d * 2, acc, vl);
+      size_t vl;
+      for (int d = 0; d < input_depth; d += vl) {
+        vl = __riscv_vsetvl_e32m4(input_depth - d);
+        // Load input values (contiguous)
+        vfloat32m4_t input = __riscv_vle32_v_f32m4(input_ptr + d, vl);
+        // Load filter even elements (stride = 2 floats = 8 bytes)
+        vfloat32m4_t filter_even = __riscv_vlse32_v_f32m4(filter_ptr + d * 2, 8, vl);
+        // Load filter odd elements (stride = 2 floats = 8 bytes)
+        vfloat32m4_t filter_odd = __riscv_vlse32_v_f32m4(filter_ptr + d * 2 + 1, 8, vl);
+        // Load acc even elements (stride = 2 floats = 8 bytes)
+        vfloat32m4_t acc_even = __riscv_vlse32_v_f32m4(acc_buffer_ptr + d * 2, 8, vl);
+        // Load acc odd elements (stride = 2 floats = 8 bytes)
+        vfloat32m4_t acc_odd = __riscv_vlse32_v_f32m4(acc_buffer_ptr + d * 2 + 1, 8, vl);
+        // Multiply-accumulate: acc_even += input * filter_even
+        acc_even = __riscv_vfmacc_vv_f32m4(acc_even, input, filter_even, vl);
+        // Multiply-accumulate: acc_odd += input * filter_odd
+        acc_odd = __riscv_vfmacc_vv_f32m4(acc_odd, input, filter_odd, vl);
+        // Store acc even elements back (stride = 2 floats = 8 bytes)
+        __riscv_vsse32_v_f32m4(acc_buffer_ptr + d * 2, 8, acc_even, vl);
+        // Store acc odd elements back (stride = 2 floats = 8 bytes)
+        __riscv_vsse32_v_f32m4(acc_buffer_ptr + d * 2 + 1, 8, acc_odd, vl);
       }
       input_ptr += input_ptr_increment;
       acc_buffer_ptr += output_depth;
+    }
+  }
+};
+
+// RVV specialization for non-strided, fixed depth=8, multiplier=1.
+// Processes 2 output pixels at a time with 8 channels per pixel.
+// Register usage: 2x filter (e32m4, vl=4) + 2x input + 2x acc = 6 groups.
+template <>
+struct FloatDepthwiseConvKernel<false, 8, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    // Load 8 filter values as 2 vectors of 4.
+    const size_t vl4 = __riscv_vsetvl_e32m4(4);
+    vfloat32m4_t filter0 = __riscv_vle32_v_f32m4(filter_ptr, vl4);
+    vfloat32m4_t filter1 = __riscv_vle32_v_f32m4(filter_ptr + 4, vl4);
+
+    int outp = 0;
+    // Process 2 output pixels at a time.
+    for (; outp <= num_output_pixels - 2; outp += 2) {
+      // Load accumulators for pixel 0.
+      vfloat32m4_t acc0_0 = __riscv_vle32_v_f32m4(acc_buffer_ptr, vl4);
+      vfloat32m4_t acc0_1 = __riscv_vle32_v_f32m4(acc_buffer_ptr + 4, vl4);
+      // Load input for pixel 0.
+      vfloat32m4_t in0_0 = __riscv_vle32_v_f32m4(input_ptr, vl4);
+      vfloat32m4_t in0_1 = __riscv_vle32_v_f32m4(input_ptr + 4, vl4);
+      // Accumulate pixel 0.
+      acc0_0 = __riscv_vfmacc_vv_f32m4(acc0_0, in0_0, filter0, vl4);
+      acc0_1 = __riscv_vfmacc_vv_f32m4(acc0_1, in0_1, filter1, vl4);
+      // Store pixel 0 accumulators.
+      __riscv_vse32_v_f32m4(acc_buffer_ptr, acc0_0, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr + 4, acc0_1, vl4);
+
+      // Load accumulators for pixel 1.
+      vfloat32m4_t acc1_0 = __riscv_vle32_v_f32m4(acc_buffer_ptr + 8, vl4);
+      vfloat32m4_t acc1_1 = __riscv_vle32_v_f32m4(acc_buffer_ptr + 12, vl4);
+      // Load input for pixel 1.
+      const float* in1_ptr = input_ptr + input_ptr_increment;
+      vfloat32m4_t in1_0 = __riscv_vle32_v_f32m4(in1_ptr, vl4);
+      vfloat32m4_t in1_1 = __riscv_vle32_v_f32m4(in1_ptr + 4, vl4);
+      // Accumulate pixel 1.
+      acc1_0 = __riscv_vfmacc_vv_f32m4(acc1_0, in1_0, filter0, vl4);
+      acc1_1 = __riscv_vfmacc_vv_f32m4(acc1_1, in1_1, filter1, vl4);
+      // Store pixel 1 accumulators.
+      __riscv_vse32_v_f32m4(acc_buffer_ptr + 8, acc1_0, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr + 12, acc1_1, vl4);
+
+      input_ptr += 2 * input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+    // Handle remaining pixel.
+    for (; outp < num_output_pixels; outp++) {
+      vfloat32m4_t acc0 = __riscv_vle32_v_f32m4(acc_buffer_ptr, vl4);
+      vfloat32m4_t acc1 = __riscv_vle32_v_f32m4(acc_buffer_ptr + 4, vl4);
+      vfloat32m4_t in0 = __riscv_vle32_v_f32m4(input_ptr, vl4);
+      vfloat32m4_t in1 = __riscv_vle32_v_f32m4(input_ptr + 4, vl4);
+      acc0 = __riscv_vfmacc_vv_f32m4(acc0, in0, filter0, vl4);
+      acc1 = __riscv_vfmacc_vv_f32m4(acc1, in1, filter1, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr, acc0, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr + 4, acc1, vl4);
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+  }
+};
+
+// RVV specialization for non-strided, fixed depth=2, multiplier=1.
+// Processes 4 output pixels at a time using scalar with filter broadcast.
+// For depth=2, vector overhead is high relative to compute; scalar is efficient.
+template <>
+struct FloatDepthwiseConvKernel<false, 2, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const float f0 = filter_ptr[0];
+    const float f1 = filter_ptr[1];
+
+    int outp = 0;
+    // Process 4 output pixels at a time with manual unrolling.
+    for (; outp <= num_output_pixels - 4; outp += 4) {
+      acc_buffer_ptr[0] += input_ptr[0] * f0;
+      acc_buffer_ptr[1] += input_ptr[1] * f1;
+      acc_buffer_ptr[2] += input_ptr[2] * f0;
+      acc_buffer_ptr[3] += input_ptr[3] * f1;
+      const float* in1 = input_ptr + input_ptr_increment;
+      acc_buffer_ptr[4] += in1[0] * f0;
+      acc_buffer_ptr[5] += in1[1] * f1;
+      acc_buffer_ptr[6] += in1[2] * f0;
+      acc_buffer_ptr[7] += in1[3] * f1;
+      const float* in2 = in1 + input_ptr_increment;
+      acc_buffer_ptr[8] += in2[0] * f0;
+      acc_buffer_ptr[9] += in2[1] * f1;
+      acc_buffer_ptr[10] += in2[2] * f0;
+      acc_buffer_ptr[11] += in2[3] * f1;
+      const float* in3 = in2 + input_ptr_increment;
+      acc_buffer_ptr[12] += in3[0] * f0;
+      acc_buffer_ptr[13] += in3[1] * f1;
+      acc_buffer_ptr[14] += in3[2] * f0;
+      acc_buffer_ptr[15] += in3[3] * f1;
+      input_ptr += 4 * input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+    // Handle remaining pixels one at a time.
+    for (; outp < num_output_pixels; outp++) {
+      acc_buffer_ptr[0] += input_ptr[0] * f0;
+      acc_buffer_ptr[1] += input_ptr[1] * f1;
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 2;
+    }
+  }
+};
+
+// RVV specialization for strided, fixed depth=8, multiplier=1.
+// Processes 2 output pixels at a time with 8 channels per pixel.
+// Register usage: 2x filter (e32m4, vl=4) + 2x input + 2x acc = 6 groups.
+template <>
+struct FloatDepthwiseConvKernel<true, 8, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const size_t vl4 = __riscv_vsetvl_e32m4(4);
+    vfloat32m4_t filter0 = __riscv_vle32_v_f32m4(filter_ptr, vl4);
+    vfloat32m4_t filter1 = __riscv_vle32_v_f32m4(filter_ptr + 4, vl4);
+
+    int outp = 0;
+    // Process 2 output pixels at a time.
+    for (; outp <= num_output_pixels - 2; outp += 2) {
+      // Load accumulators for pixel 0.
+      vfloat32m4_t acc0_0 = __riscv_vle32_v_f32m4(acc_buffer_ptr, vl4);
+      vfloat32m4_t acc0_1 = __riscv_vle32_v_f32m4(acc_buffer_ptr + 4, vl4);
+      // Load input for pixel 0.
+      vfloat32m4_t in0_0 = __riscv_vle32_v_f32m4(input_ptr, vl4);
+      vfloat32m4_t in0_1 = __riscv_vle32_v_f32m4(input_ptr + 4, vl4);
+      // Accumulate pixel 0.
+      acc0_0 = __riscv_vfmacc_vv_f32m4(acc0_0, in0_0, filter0, vl4);
+      acc0_1 = __riscv_vfmacc_vv_f32m4(acc0_1, in0_1, filter1, vl4);
+      // Store pixel 0 accumulators.
+      __riscv_vse32_v_f32m4(acc_buffer_ptr, acc0_0, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr + 4, acc0_1, vl4);
+
+      // Load accumulators for pixel 1.
+      vfloat32m4_t acc1_0 = __riscv_vle32_v_f32m4(acc_buffer_ptr + 8, vl4);
+      vfloat32m4_t acc1_1 = __riscv_vle32_v_f32m4(acc_buffer_ptr + 12, vl4);
+      // Load input for pixel 1.
+      const float* in1_ptr = input_ptr + input_ptr_increment;
+      vfloat32m4_t in1_0 = __riscv_vle32_v_f32m4(in1_ptr, vl4);
+      vfloat32m4_t in1_1 = __riscv_vle32_v_f32m4(in1_ptr + 4, vl4);
+      // Accumulate pixel 1.
+      acc1_0 = __riscv_vfmacc_vv_f32m4(acc1_0, in1_0, filter0, vl4);
+      acc1_1 = __riscv_vfmacc_vv_f32m4(acc1_1, in1_1, filter1, vl4);
+      // Store pixel 1 accumulators.
+      __riscv_vse32_v_f32m4(acc_buffer_ptr + 8, acc1_0, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr + 12, acc1_1, vl4);
+
+      input_ptr += 2 * input_ptr_increment;
+      acc_buffer_ptr += 16;
+    }
+    // Handle remaining pixel.
+    for (; outp < num_output_pixels; outp++) {
+      vfloat32m4_t acc0 = __riscv_vle32_v_f32m4(acc_buffer_ptr, vl4);
+      vfloat32m4_t acc1 = __riscv_vle32_v_f32m4(acc_buffer_ptr + 4, vl4);
+      vfloat32m4_t in0 = __riscv_vle32_v_f32m4(input_ptr, vl4);
+      vfloat32m4_t in1 = __riscv_vle32_v_f32m4(input_ptr + 4, vl4);
+      acc0 = __riscv_vfmacc_vv_f32m4(acc0, in0, filter0, vl4);
+      acc1 = __riscv_vfmacc_vv_f32m4(acc1, in1, filter1, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr, acc0, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr + 4, acc1, vl4);
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+  }
+};
+
+// RVV specialization for strided, fixed depth=4, multiplier=1.
+template <>
+struct FloatDepthwiseConvKernel<true, 4, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const size_t vl4 = __riscv_vsetvl_e32m4(4);
+    vfloat32m4_t filter = __riscv_vle32_v_f32m4(filter_ptr, vl4);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      vfloat32m4_t acc = __riscv_vle32_v_f32m4(acc_buffer_ptr, vl4);
+      vfloat32m4_t in = __riscv_vle32_v_f32m4(input_ptr, vl4);
+      acc = __riscv_vfmacc_vv_f32m4(acc, in, filter, vl4);
+      __riscv_vse32_v_f32m4(acc_buffer_ptr, acc, vl4);
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 4;
+    }
+  }
+};
+
+// RVV specialization for strided, fixed depth=2, multiplier=1.
+template <>
+struct FloatDepthwiseConvKernel<true, 2, 1> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const float f0 = filter_ptr[0];
+    const float f1 = filter_ptr[1];
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      acc_buffer_ptr[0] += input_ptr[0] * f0;
+      acc_buffer_ptr[1] += input_ptr[1] * f1;
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 2;
+    }
+  }
+};
+
+// RVV specialization for variable depth, multiplier=3.
+// Uses strided loads/stores to process multiple input channels at once.
+// For each input channel, 3 output channels are produced (stride=3).
+template <>
+struct FloatDepthwiseConvKernel<true, 0, 3> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const int output_depth = input_depth * 3;
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      size_t vl;
+      for (int d = 0; d < input_depth; d += vl) {
+        vl = __riscv_vsetvl_e32m4(input_depth - d);
+        // Load input values (contiguous)
+        vfloat32m4_t input = __riscv_vle32_v_f32m4(input_ptr + d, vl);
+        // Load filter elements with stride=3 (12 bytes between each)
+        vfloat32m4_t filter_0 = __riscv_vlse32_v_f32m4(filter_ptr + d * 3, 12, vl);
+        vfloat32m4_t filter_1 = __riscv_vlse32_v_f32m4(filter_ptr + d * 3 + 1, 12, vl);
+        vfloat32m4_t filter_2 = __riscv_vlse32_v_f32m4(filter_ptr + d * 3 + 2, 12, vl);
+        // Load acc elements with stride=3 (12 bytes between each)
+        vfloat32m4_t acc_0 = __riscv_vlse32_v_f32m4(acc_buffer_ptr + d * 3, 12, vl);
+        vfloat32m4_t acc_1 = __riscv_vlse32_v_f32m4(acc_buffer_ptr + d * 3 + 1, 12, vl);
+        vfloat32m4_t acc_2 = __riscv_vlse32_v_f32m4(acc_buffer_ptr + d * 3 + 2, 12, vl);
+        // Multiply-accumulate: acc_0 += input * filter_0
+        acc_0 = __riscv_vfmacc_vv_f32m4(acc_0, input, filter_0, vl);
+        // Multiply-accumulate: acc_1 += input * filter_1
+        acc_1 = __riscv_vfmacc_vv_f32m4(acc_1, input, filter_1, vl);
+        // Multiply-accumulate: acc_2 += input * filter_2
+        acc_2 = __riscv_vfmacc_vv_f32m4(acc_2, input, filter_2, vl);
+        // Store acc elements back with stride=3 (12 bytes between each)
+        __riscv_vsse32_v_f32m4(acc_buffer_ptr + d * 3, 12, acc_0, vl);
+        __riscv_vsse32_v_f32m4(acc_buffer_ptr + d * 3 + 1, 12, acc_1, vl);
+        __riscv_vsse32_v_f32m4(acc_buffer_ptr + d * 3 + 2, 12, acc_2, vl);
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += output_depth;
+    }
+  }
+};
+
+// RVV specialization for variable depth, multiplier=8.
+// Vectorized: vfmacc_vf broadcasts scalar input.
+template <>
+struct FloatDepthwiseConvKernel<true, 0, 8> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const int output_depth = input_depth * 8;
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int d = 0; d < input_depth; d++) {
+        float in_val = input_ptr[d];
+        size_t vl;
+        for (int m = 0; m < 8; m += vl) {
+          vl = __riscv_vsetvl_e32m8(8 - m);
+          vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + d * 8 + m, vl);
+          vfloat32m8_t filt = __riscv_vle32_v_f32m8(filter_ptr + d * 8 + m, vl);
+          acc = __riscv_vfmacc_vf_f32m8(acc, in_val, filt, vl);
+          __riscv_vse32_v_f32m8(acc_buffer_ptr + d * 8 + m, acc, vl);
+        }
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += output_depth;
+    }
+  }
+};
+
+// RVV specialization for variable depth, multiplier=16.
+template <>
+struct FloatDepthwiseConvKernel<true, 0, 16> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const int output_depth = input_depth * 16;
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int d = 0; d < input_depth; d++) {
+        float in_val = input_ptr[d];
+        size_t vl;
+        for (int m = 0; m < 16; m += vl) {
+          vl = __riscv_vsetvl_e32m8(16 - m);
+          vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + d * 16 + m, vl);
+          vfloat32m8_t filt = __riscv_vle32_v_f32m8(filter_ptr + d * 16 + m, vl);
+          acc = __riscv_vfmacc_vf_f32m8(acc, in_val, filt, vl);
+          __riscv_vse32_v_f32m8(acc_buffer_ptr + d * 16 + m, acc, vl);
+        }
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += output_depth;
+    }
+  }
+};
+
+// RVV specialization for depth=1, multiplier=8.
+// Vectorized: vfmacc_vf broadcasts scalar input to all lanes.
+template <>
+struct FloatDepthwiseConvKernel<true, 1, 8> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      float in_val = input_ptr[0];
+      size_t vl;
+      for (int m = 0; m < 8; m += vl) {
+        vl = __riscv_vsetvl_e32m8(8 - m);
+        vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + m, vl);
+        vfloat32m8_t filt = __riscv_vle32_v_f32m8(filter_ptr + m, vl);
+        acc = __riscv_vfmacc_vf_f32m8(acc, in_val, filt, vl);
+        __riscv_vse32_v_f32m8(acc_buffer_ptr + m, acc, vl);
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 8;
+    }
+  }
+};
+
+// RVV specialization for depth=1, multiplier=20.
+template <>
+struct FloatDepthwiseConvKernel<true, 1, 20> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      float in_val = input_ptr[0];
+      size_t vl;
+      for (int m = 0; m < 20; m += vl) {
+        vl = __riscv_vsetvl_e32m8(20 - m);
+        vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + m, vl);
+        vfloat32m8_t filt = __riscv_vle32_v_f32m8(filter_ptr + m, vl);
+        acc = __riscv_vfmacc_vf_f32m8(acc, in_val, filt, vl);
+        __riscv_vse32_v_f32m8(acc_buffer_ptr + m, acc, vl);
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 20;
+    }
+  }
+};
+
+// RVV specialization for depth=1, multiplier=32.
+template <>
+struct FloatDepthwiseConvKernel<true, 1, 32> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      float in_val = input_ptr[0];
+      size_t vl;
+      for (int m = 0; m < 32; m += vl) {
+        vl = __riscv_vsetvl_e32m8(32 - m);
+        vfloat32m8_t acc = __riscv_vle32_v_f32m8(acc_buffer_ptr + m, vl);
+        vfloat32m8_t filt = __riscv_vle32_v_f32m8(filter_ptr + m, vl);
+        acc = __riscv_vfmacc_vf_f32m8(acc, in_val, filt, vl);
+        __riscv_vse32_v_f32m8(acc_buffer_ptr + m, acc, vl);
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 32;
+    }
+  }
+};
+
+// RVV specialization for depth=3, multiplier=2.
+template <>
+struct FloatDepthwiseConvKernel<true, 3, 2> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      for (int d = 0; d < 3; d++) {
+        float in_val = input_ptr[d];
+        acc_buffer_ptr[d * 2] += in_val * filter_ptr[d * 2];
+        acc_buffer_ptr[d * 2 + 1] += in_val * filter_ptr[d * 2 + 1];
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 6;
+    }
+  }
+};
+
+// RVV specialization for depth=3, multiplier=4.
+// Uses vfmacc_vf to broadcast scalar input and process 4 multiplier outputs.
+template <>
+struct FloatDepthwiseConvKernel<true, 3, 4> {
+  static void Run(int num_output_pixels, int input_depth, int depth_multiplier,
+                  const float* input_ptr, int input_ptr_increment,
+                  const float* filter_ptr, float* acc_buffer_ptr) {
+    const size_t vl4 = __riscv_vsetvl_e32m4(4);
+    for (int outp = 0; outp < num_output_pixels; outp++) {
+      // Process 3 input channels, each with 4 multiplier outputs
+      for (int d = 0; d < 3; d++) {
+        float in_val = input_ptr[d];
+        // Load 4 filter values for this input channel
+        vfloat32m4_t filt = __riscv_vle32_v_f32m4(filter_ptr + d * 4, vl4);
+        // Load 4 acc values for this input channel
+        vfloat32m4_t acc = __riscv_vle32_v_f32m4(acc_buffer_ptr + d * 4, vl4);
+        // Multiply-accumulate: acc += in_val * filter (broadcast scalar)
+        acc = __riscv_vfmacc_vf_f32m4(acc, in_val, filt, vl4);
+        // Store 4 acc values back
+        __riscv_vse32_v_f32m4(acc_buffer_ptr + d * 4, acc, vl4);
+      }
+      input_ptr += input_ptr_increment;
+      acc_buffer_ptr += 12;
     }
   }
 };
@@ -1043,9 +1489,26 @@ inline void DepthwiseConvImpl(
 #endif  // USE_NEON
 
 #ifdef USE_RVV
+  // RVV kernels: fixed depth, non-strided (fastest).
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 8, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(false, 2, 1)
+  // RVV kernels: fixed depth, strided.
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 8, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 4, 1)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 2, 1)
+  // RVV kernels: fixed depth=1, various multipliers.
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 32)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 20)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 1, 8)
+  // RVV kernels: fixed depth=3, various multipliers.
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 3, 4)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 3, 2)
   // RVV kernels: variable input depth, most general.
   // These use vsetvl to naturally handle any depth.
   // Note: kAllowStrided must be true when kFixedInputDepth==0 (static_assert).
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 16)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 8)
+  TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 3)
   TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 1)
   TFMINI_USE_DEPTHWISECONV_KERNEL(true, 0, 2)
 #endif  // USE_RVV
