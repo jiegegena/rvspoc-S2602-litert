@@ -52,6 +52,54 @@
         "LITERT_AUTO_BUILD_TFLITE": "ON",
         "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
       }
+    },
+    {
+      "name": "linux-riscv64",
+      "displayName": "Linux RISC-V 64 Release",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/cmake_build_riscv64",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Linux",
+        "CMAKE_SYSTEM_PROCESSOR": "riscv64",
+        "CMAKE_BUILD_TYPE": "Release",
+        "LITERT_AUTO_BUILD_TFLITE": "ON",
+        "TENSORFLOW_SOURCE_DIR": "${sourceDir}/tensorflow-src",
+        "TFLITE_HOST_TOOLS_DIR": "${sourceDir}/../host_flatc_build/_deps/flatbuffers-build",
+        "CMAKE_C_COMPILER": "riscv64-linux-gnu-gcc",
+        "CMAKE_CXX_COMPILER": "riscv64-linux-gnu-g++",
+        "CMAKE_C_FLAGS": "-march=rv64gc -mabi=lp64d",
+        "CMAKE_CXX_FLAGS": "-fpermissive -march=rv64gc -mabi=lp64d",
+        "LITERT_ENABLE_GPU": "OFF",
+        "LITERT_ENABLE_NPU": "OFF",
+        "TFLITE_ENABLE_RUY": "ON",
+        "TFLITE_ENABLE_XNNPACK": "OFF",
+        "TFLITE_ENABLE_BENCHMARK_MODEL": "ON",
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
+      }
+    },
+    {
+      "name": "linux-riscv64-rvv",
+      "displayName": "Linux RISC-V 64 Rvv Release",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/cmake_build_riscv64_rvv",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Linux",
+        "CMAKE_SYSTEM_PROCESSOR": "riscv64",
+        "CMAKE_BUILD_TYPE": "Release",
+        "LITERT_AUTO_BUILD_TFLITE": "ON",
+        "TENSORFLOW_SOURCE_DIR": "${sourceDir}/tensorflow-src",
+        "TFLITE_HOST_TOOLS_DIR": "${sourceDir}/../host_flatc_build/_deps/flatbuffers-build",
+        "CMAKE_C_COMPILER": "riscv64-linux-gnu-gcc",
+        "CMAKE_CXX_COMPILER": "riscv64-linux-gnu-g++",
+        "CMAKE_C_FLAGS": "-march=rv64gcv -mabi=lp64d",
+        "CMAKE_CXX_FLAGS": "-fpermissive -march=rv64gcv -mabi=lp64d",
+        "LITERT_ENABLE_GPU": "OFF",
+        "LITERT_ENABLE_NPU": "OFF",
+        "TFLITE_ENABLE_RUY": "ON",
+        "TFLITE_ENABLE_XNNPACK": "OFF",
+        "TFLITE_ENABLE_BENCHMARK_MODEL": "ON",
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
+      }
     }
   ]
 }
