@@ -28,3 +28,7 @@ cmake_build/
 .vscode/
 *.whl
 /.litert_configure.bazelrc
+
+# s206_test
+litert/cmake_build_riscv64*
+tflite/tools/accuracy/ILSVRC2012_img_val/.venv
